@@ -57,6 +57,7 @@ make -C /lib/modules/$(uname -r)/build M=$(pwd) modules
 ## 加载模块
 
 ```bash
+cd /usr/src/linux-source-5.15.0/drivers/nvme/host
 sudo rmmod nvme
 sudo insmod ./nvme.ko
 ```
@@ -72,5 +73,5 @@ ssh -p 8080 g122622@localhost
 看内核日志
 
 ```bash
-dmesg | tail -20
+sudo dmesg | tail -20
 ```

@@ -26,6 +26,8 @@
 #include <linux/io-64-nonatomic-hi-lo.h>
 #include <linux/sed-opal.h>
 #include <linux/pci-p2pdma.h>
+#include <linux/highmem.h>
+#include <linux/workqueue.h>
 
 #include "trace.h"
 #include "nvme.h"
@@ -109,6 +111,97 @@ static void nvme_dev_disable(struct nvme_dev *dev, bool shutdown);
 static bool __nvme_disable_io_queues(struct nvme_dev *dev, u8 opcode);
 
 /*
+ * Host-side WB vendor protocol opcodes (corrected mapping):
+ *   0xd1 admin  WB_HMB_KVA_MAPPING_PUSH  (Host -> Controller)
+ *   0xd5 I/O    WB_NOTIFY_COPY_DONE      (Host -> Controller)
+ *   0xd9 I/O    WB_NOTIFY_READ_DONE      (Host -> Controller)
+ */
+#define NVME_WB_ADM_KVA_MAPPING_PUSH	0xd1
+#define NVME_WB_IO_NOTIFY_COPY_DONE	0xd5
+#define NVME_WB_IO_NOTIFY_READ_DONE	0xd9
+
+/* Keep in sync with controller-side config (FEMU common/l2p-cache-config.h). */
+#define NVME_WB_L2P_L2_SIZE_KB		(16 * 1024)
+#define NVME_WB_ALIGN_BYTES		4096ULL
+#define NVME_WB_MCP_ENTRY_BYTES		64U
+#define NVME_WB_MCP_ENTRIES_PER_Q	1024U
+
+/* Controller encodes MCP_READY in CQE DW1 bit0 => result.u64 bit32 on host. */
+#define NVME_WB_CQE_MCP_READY_MASK	(1ULL << 32)
+
+#define NVME_WB_MCP_TYPE_WRITE_ALLOC	0
+#define NVME_WB_MCP_TYPE_READ_HIT	1
+#define NVME_WB_MCP_F_LAST_SEG		(1U << 0)
+
+struct nvme_wb_kva_push_entry {
+	__le64 gpa;
+	__le64 kva;
+} __packed;
+
+struct nvme_wb_mcp_entry {
+	__le32 cmd_id;
+	__le32 metadata_size;
+
+	__le64 hmb_vaddr;
+	__le64 hmb_off;
+
+	__le32 prp_off;
+	__le32 length;
+
+	__le64 slba;
+	__le64 lpn;
+
+	__le32 nlb;
+	__le16 qid;
+	u8 type;
+	u8 flags;
+
+	u8 rsvd[8];
+} __packed;
+
+struct nvme_wb_work_item {
+	struct work_struct work;
+	struct list_head node;
+	struct request *req;
+	u16 qid;
+	u16 cmd_id;
+	bool is_write;
+};
+
+struct nvme_wb_queue_ctx {
+	struct workqueue_struct *wq;
+	spinlock_t lock;
+	struct list_head pending;
+
+	u64 wb_off;
+	u64 wb_bytes;
+	u64 mcp_off;
+	u32 mcp_capacity;
+	u32 mcp_head;
+};
+
+struct nvme_wb_ctx {
+	bool host_enabled;
+	bool map_pushed;
+	u32 kva_seq;
+	u32 nr_io_queues_layout;
+
+	u64 hmb_l2p_bytes;
+	u64 hmb_wb_base;
+	u64 hmb_wb_bytes;
+
+	struct nvme_wb_queue_ctx *qctx;
+
+	atomic64_t mcp_ready_cnt;
+	atomic64_t mcp_parse_fail_cnt;
+	atomic64_t copy_done_submit_cnt;
+	atomic64_t read_done_submit_cnt;
+	atomic64_t fallback_cnt;
+};
+
+static_assert(sizeof(struct nvme_wb_mcp_entry) == NVME_WB_MCP_ENTRY_BYTES);
+
+/*
  * Represents an NVM Express device.  Each nvme_dev is a PCI function.
  */
 struct nvme_dev {
@@ -154,12 +247,19 @@ struct nvme_dev {
 	dma_addr_t host_mem_descs_dma;
 	struct nvme_host_mem_buf_desc *host_mem_descs;
 	void **host_mem_desc_bufs;
+	struct nvme_wb_ctx wb;
 	unsigned int nr_allocated_queues;
 	unsigned int nr_write_queues;
 	unsigned int nr_poll_queues;
 
 	bool attrs_added;
 };
+
+static void nvme_wb_try_complete_deferred(struct nvme_dev *dev,
+		struct request *req, struct nvme_completion *cqe, u16 qid);
+static void nvme_wb_host_reset(struct nvme_dev *dev, bool fail_pending);
+static void nvme_wb_try_push_kva_mapping(struct nvme_dev *dev,
+		const char *reason);
 
 static int io_queue_depth_set(const char *val, const struct kernel_param *kp)
 {
@@ -1022,8 +1122,7 @@ static inline void nvme_handle_cqe(struct nvme_queue *nvmeq, u16 idx)
 	}
 
 	trace_nvme_sq(req, cqe->sq_head, nvmeq->sq_tail);
-	if (!nvme_try_complete_req(req, cqe->status, cqe->result))
-		nvme_pci_complete_rq(req);
+	nvme_wb_try_complete_deferred(nvmeq->dev, req, cqe, nvmeq->qid);
 }
 
 static inline void nvme_update_cq_head(struct nvme_queue *nvmeq)
@@ -1886,6 +1985,596 @@ static void nvme_map_cmb(struct nvme_dev *dev)
 		pci_p2pmem_publish(pdev, true);
 }
 
+static inline u64 nvme_wb_align_up(u64 v, u64 a)
+{
+	return DIV_ROUND_UP_ULL(v, a) * a;
+}
+
+static inline u64 nvme_wb_align_down(u64 v, u64 a)
+{
+	return (v / a) * a;
+}
+
+static bool nvme_wb_hmb_memcpy(struct nvme_dev *dev, u64 off, void *buf,
+		u32 len, bool write)
+{
+	u8 *p = buf;
+	u64 cur = 0;
+	u32 left = len;
+	u32 i;
+
+	if (!dev->host_mem_descs || !dev->host_mem_desc_bufs)
+		return false;
+	if (off + len > dev->host_mem_size)
+		return false;
+
+	for (i = 0; i < dev->nr_host_mem_descs && left; i++) {
+		struct nvme_host_mem_buf_desc *desc = &dev->host_mem_descs[i];
+		u64 seg_sz = (u64)le32_to_cpu(desc->size) * NVME_CTRL_PAGE_SIZE;
+		u64 in_seg, seg_avail;
+		u32 xfer;
+		u8 *base;
+
+		if (off >= cur + seg_sz) {
+			cur += seg_sz;
+			continue;
+		}
+
+		base = dev->host_mem_desc_bufs[i];
+		if (!base)
+			return false;
+
+		in_seg = off > cur ? off - cur : 0;
+		seg_avail = seg_sz - in_seg;
+		xfer = min_t(u32, left, (u32)seg_avail);
+
+		if (write)
+			memcpy(base + in_seg, p, xfer);
+		else
+			memcpy(p, base + in_seg, xfer);
+
+		p += xfer;
+		off += xfer;
+		left -= xfer;
+		cur += seg_sz;
+	}
+
+	return left == 0;
+}
+
+static bool nvme_wb_read_mcp_entry(struct nvme_dev *dev,
+		struct nvme_wb_queue_ctx *qctx, u32 slot,
+		struct nvme_wb_mcp_entry *entry)
+{
+	u64 off;
+
+	if (slot >= qctx->mcp_capacity)
+		return false;
+
+	off = qctx->mcp_off + (u64)slot * sizeof(*entry);
+	return nvme_wb_hmb_memcpy(dev, off, entry, sizeof(*entry), false);
+}
+
+/*
+ * Q11A: this copy helper intentionally targets regular bio-backed I/O path.
+ * It does not attempt to provide special handling for every corner case
+ * (metadata streams, exotic payload sources). On unsupported layouts it fails
+ * fast and the request is completed with error for observability.
+ */
+static int nvme_wb_copy_req_payload(struct request *req, u32 req_off,
+		void *hmb_addr, u32 len, bool to_hmb)
+{
+	struct req_iterator iter;
+	struct bio_vec bvec;
+	u32 pos = 0;
+	u32 left = len;
+	u8 *hmb = hmb_addr;
+
+	rq_for_each_segment(bvec, req, iter) {
+		unsigned int seg_len = bvec.bv_len;
+		unsigned int seg_off;
+		unsigned int xfer;
+		void *kaddr;
+
+		if (!left)
+			break;
+
+		if (req_off >= pos + seg_len) {
+			pos += seg_len;
+			continue;
+		}
+
+		seg_off = req_off > pos ? req_off - pos : 0;
+		xfer = min_t(unsigned int, left, seg_len - seg_off);
+
+		kaddr = kmap_local_page(bvec.bv_page);
+		if (to_hmb)
+			memcpy(hmb, (u8 *)kaddr + bvec.bv_offset + seg_off, xfer);
+		else
+			memcpy((u8 *)kaddr + bvec.bv_offset + seg_off, hmb, xfer);
+		kunmap_local(kaddr);
+
+		hmb += xfer;
+		left -= xfer;
+		req_off += xfer;
+		pos += seg_len;
+	}
+
+	return left ? -EINVAL : 0;
+}
+
+static void nvme_wb_notify_endio(struct request *req, blk_status_t error)
+{
+	blk_mq_free_request(req);
+}
+
+static struct request *nvme_wb_alloc_io_req_qid(struct request_queue *q,
+		struct nvme_command *cmd, u16 qid)
+{
+	struct request *req;
+
+	req = blk_mq_alloc_request_hctx(q, REQ_OP_DRV_OUT,
+			BLK_MQ_REQ_NOWAIT, qid ? qid - 1 : 0);
+	if (IS_ERR(req))
+		return req;
+
+	if (req->q->queuedata)
+		req->timeout = NVME_IO_TIMEOUT;
+	else
+		req->timeout = NVME_ADMIN_TIMEOUT;
+
+	cmd->common.flags &= ~NVME_CMD_SGL_ALL;
+	req->cmd_flags |= REQ_FAILFAST_DRIVER;
+	if (req->mq_hctx->type == HCTX_TYPE_POLL)
+		req->cmd_flags |= REQ_HIPRI;
+
+	nvme_req(req)->status = 0;
+	nvme_req(req)->retries = 0;
+	nvme_req(req)->flags = 0;
+	req->rq_flags |= RQF_DONTPREP;
+	memcpy(nvme_req(req)->cmd, cmd, sizeof(*cmd));
+
+	return req;
+}
+
+/* Q8A/Q9A: fire-and-forget submit on the original qid. */
+static void nvme_wb_submit_notify(struct nvme_dev *dev, struct request *orig,
+		u16 qid, u16 cmd_id, u32 seg_cnt, bool is_write)
+{
+	struct nvme_command cmd = { };
+	struct request *req;
+
+	cmd.common.opcode = is_write ? NVME_WB_IO_NOTIFY_COPY_DONE :
+		NVME_WB_IO_NOTIFY_READ_DONE;
+	cmd.common.nsid = cpu_to_le32(0);
+	cmd.common.cdw10 = cpu_to_le32(cmd_id);
+	cmd.common.cdw11 = cpu_to_le32(qid);
+	cmd.common.cdw12 = cpu_to_le32(seg_cnt);
+
+	req = nvme_wb_alloc_io_req_qid(orig->q, &cmd, qid);
+	if (IS_ERR(req)) {
+		dev_warn(dev->ctrl.device,
+			"[WB-HOST][8A][9A] notify submit alloc failed qid=%u cmd_id=%u seg_cnt=%u op=0x%x\n",
+			qid, cmd_id, seg_cnt, cmd.common.opcode);
+		atomic64_inc(&dev->wb.fallback_cnt);
+		return;
+	}
+
+	if (is_write)
+		atomic64_inc(&dev->wb.copy_done_submit_cnt);
+	else
+		atomic64_inc(&dev->wb.read_done_submit_cnt);
+
+	blk_execute_rq_nowait(NULL, req, false, nvme_wb_notify_endio);
+}
+
+static void nvme_wb_finish_req_fail(struct nvme_dev *dev, struct request *req)
+{
+	nvme_req(req)->status = NVME_SC_INTERNAL;
+	nvme_pci_complete_rq(req);
+	atomic64_inc(&dev->wb.fallback_cnt);
+}
+
+static void nvme_wb_workfn(struct work_struct *work)
+{
+	struct nvme_wb_work_item *item =
+		container_of(work, struct nvme_wb_work_item, work);
+	struct request *req = item->req;
+	struct nvme_queue *nvmeq = req->mq_hctx->driver_data;
+	struct nvme_dev *dev = nvmeq->dev;
+	struct nvme_wb_queue_ctx *qctx;
+	struct nvme_wb_mcp_entry e;
+	u32 seg_cnt = 0;
+	bool done = false;
+
+	if (!dev->wb.host_enabled || !dev->wb.qctx ||
+	    item->qid == 0 || item->qid > dev->wb.nr_io_queues_layout) {
+		nvme_wb_finish_req_fail(dev, req);
+		goto out_free;
+	}
+
+	qctx = &dev->wb.qctx[item->qid];
+
+	while (!done) {
+		u16 cmd_id;
+		u16 qid;
+		u32 len;
+		u32 off;
+		u64 hmb_vaddr;
+		int ret;
+
+		if (!nvme_wb_read_mcp_entry(dev, qctx, qctx->mcp_head, &e)) {
+			dev_warn(dev->ctrl.device,
+				"[WB-HOST][7A] mcp read failed qid=%u head=%u\n",
+				item->qid, qctx->mcp_head);
+			atomic64_inc(&dev->wb.mcp_parse_fail_cnt);
+			nvme_wb_finish_req_fail(dev, req);
+			goto out_free;
+		}
+
+		cmd_id = le32_to_cpu(e.cmd_id);
+		qid = le16_to_cpu(e.qid);
+		len = le32_to_cpu(e.length);
+		off = le32_to_cpu(e.prp_off);
+		hmb_vaddr = le64_to_cpu(e.hmb_vaddr);
+
+		if (unlikely(cmd_id != item->cmd_id || qid != item->qid ||
+			     le32_to_cpu(e.metadata_size) != NVME_WB_MCP_ENTRY_BYTES ||
+			     !len || !hmb_vaddr)) {
+			dev_warn(dev->ctrl.device,
+				"[WB-HOST][7A][9A] mcp parse fail qid=%u head=%u exp(cmd=%u qid=%u) got(cmd=%u qid=%u md=%u len=%u kva=0x%llx)\n",
+				item->qid, qctx->mcp_head,
+				item->cmd_id, item->qid,
+				cmd_id, qid,
+				le32_to_cpu(e.metadata_size), len,
+				(unsigned long long)hmb_vaddr);
+			atomic64_inc(&dev->wb.mcp_parse_fail_cnt);
+			nvme_wb_finish_req_fail(dev, req);
+			goto out_free;
+		}
+
+		if (item->is_write && e.type != NVME_WB_MCP_TYPE_WRITE_ALLOC) {
+			dev_warn(dev->ctrl.device,
+				"[WB-HOST][7A] type mismatch(write) qid=%u cmd_id=%u type=%u\n",
+				item->qid, item->cmd_id, e.type);
+			atomic64_inc(&dev->wb.mcp_parse_fail_cnt);
+			nvme_wb_finish_req_fail(dev, req);
+			goto out_free;
+		}
+		if (!item->is_write && e.type != NVME_WB_MCP_TYPE_READ_HIT) {
+			dev_warn(dev->ctrl.device,
+				"[WB-HOST][7A] type mismatch(read) qid=%u cmd_id=%u type=%u\n",
+				item->qid, item->cmd_id, e.type);
+			atomic64_inc(&dev->wb.mcp_parse_fail_cnt);
+			nvme_wb_finish_req_fail(dev, req);
+			goto out_free;
+		}
+
+		ret = nvme_wb_copy_req_payload(req, off,
+			(void *)(uintptr_t)hmb_vaddr, len, item->is_write);
+		if (ret) {
+			dev_warn(dev->ctrl.device,
+				"[WB-HOST][7A][11A] payload copy failed qid=%u cmd_id=%u off=%u len=%u err=%d\n",
+				item->qid, item->cmd_id, off, len, ret);
+			atomic64_inc(&dev->wb.mcp_parse_fail_cnt);
+			nvme_wb_finish_req_fail(dev, req);
+			goto out_free;
+		}
+
+		seg_cnt++;
+		qctx->mcp_head = (qctx->mcp_head + 1) % qctx->mcp_capacity;
+		done = !!(e.flags & NVME_WB_MCP_F_LAST_SEG);
+	}
+
+	/* Q6A: always report full seg_cnt per command in a single notify. */
+	if (!seg_cnt) {
+		dev_warn(dev->ctrl.device,
+			"[WB-HOST][6A] seg_cnt=0 qid=%u cmd_id=%u\n",
+			item->qid, item->cmd_id);
+		nvme_wb_finish_req_fail(dev, req);
+		goto out_free;
+	}
+
+	nvme_wb_submit_notify(dev, req, item->qid, item->cmd_id,
+			seg_cnt, item->is_write);
+	nvme_pci_complete_rq(req);
+
+out_free:
+	if (dev->wb.qctx && item->qid <= dev->wb.nr_io_queues_layout) {
+		unsigned long flags;
+
+		qctx = &dev->wb.qctx[item->qid];
+		spin_lock_irqsave(&qctx->lock, flags);
+		if (!list_empty(&item->node))
+			list_del_init(&item->node);
+		spin_unlock_irqrestore(&qctx->lock, flags);
+	}
+	kfree(item);
+}
+
+static void nvme_wb_cancel_all_pending(struct nvme_dev *dev)
+{
+	u32 qid;
+
+	if (!dev->wb.qctx)
+		return;
+
+	for (qid = 1; qid <= dev->wb.nr_io_queues_layout; qid++) {
+		struct nvme_wb_queue_ctx *qctx = &dev->wb.qctx[qid];
+		struct nvme_wb_work_item *item, *tmp;
+		LIST_HEAD(cancel_list);
+		unsigned long flags;
+
+		if (qctx->wq)
+			flush_workqueue(qctx->wq);
+
+		spin_lock_irqsave(&qctx->lock, flags);
+		list_for_each_entry_safe(item, tmp, &qctx->pending, node) {
+			list_move_tail(&item->node, &cancel_list);
+		}
+		spin_unlock_irqrestore(&qctx->lock, flags);
+
+		list_for_each_entry_safe(item, tmp, &cancel_list, node) {
+			list_del_init(&item->node);
+			nvme_wb_finish_req_fail(dev, item->req);
+			kfree(item);
+		}
+	}
+}
+
+static void nvme_wb_destroy_qctx(struct nvme_dev *dev)
+{
+	u32 qid;
+
+	nvme_wb_cancel_all_pending(dev);
+
+	if (!dev->wb.qctx)
+		return;
+
+	for (qid = 1; qid <= dev->wb.nr_io_queues_layout; qid++) {
+		if (dev->wb.qctx[qid].wq)
+			destroy_workqueue(dev->wb.qctx[qid].wq);
+	}
+
+	kfree(dev->wb.qctx);
+	dev->wb.qctx = NULL;
+	dev->wb.nr_io_queues_layout = 0;
+}
+
+/* Q12A: reset/suspend/remove cancels pending MCP work. */
+static void nvme_wb_host_reset(struct nvme_dev *dev, bool fail_pending)
+{
+	dev->wb.host_enabled = false;
+	dev->wb.map_pushed = false;
+
+	if (fail_pending)
+		nvme_wb_destroy_qctx(dev);
+}
+
+static int nvme_wb_setup_layout_and_workers(struct nvme_dev *dev)
+{
+	u64 page_sz = NVME_WB_ALIGN_BYTES;
+	u64 l2_bytes = (u64)NVME_WB_L2P_L2_SIZE_KB * 1024ULL;
+	u64 l2_end = nvme_wb_align_up(l2_bytes, page_sz);
+	u64 wb_total_pages;
+	u64 wb_total_bytes;
+	u64 pages_per_q;
+	u64 mcp_bytes_raw;
+	u64 mcp_bytes_aligned;
+	u64 mcp_pages;
+	u64 cursor_pages = 0;
+	u32 nr_io_queues;
+	u32 qid;
+
+	/* Q4B: use queue_count-1 to match chosen policy. */
+	nr_io_queues = dev->ctrl.queue_count > 1 ? dev->ctrl.queue_count - 1 : 0;
+	dev_info(dev->ctrl.device,
+		"[WB-HOST][4B] layout uses ctrl.queue_count-1: queue_count=%u nr_io_queues=%u\n",
+		dev->ctrl.queue_count, nr_io_queues);
+
+	if (!nr_io_queues)
+		return -EAGAIN;
+
+	if (dev->host_mem_size <= l2_end)
+		return -EINVAL;
+
+	wb_total_bytes = nvme_wb_align_down(dev->host_mem_size - l2_end, page_sz);
+	wb_total_pages = wb_total_bytes / page_sz;
+	if (!wb_total_pages)
+		return -EINVAL;
+
+	pages_per_q = wb_total_pages / nr_io_queues;
+	if (!pages_per_q)
+		return -EINVAL;
+
+	mcp_bytes_raw = (u64)NVME_WB_MCP_ENTRIES_PER_Q * NVME_WB_MCP_ENTRY_BYTES;
+	mcp_bytes_aligned = nvme_wb_align_up(mcp_bytes_raw, page_sz);
+	mcp_pages = mcp_bytes_aligned / page_sz;
+	if (pages_per_q <= mcp_pages)
+		return -EINVAL;
+
+	if (dev->wb.qctx && dev->wb.nr_io_queues_layout != nr_io_queues)
+		nvme_wb_destroy_qctx(dev);
+
+	if (!dev->wb.qctx) {
+		dev->wb.qctx = kcalloc(nr_io_queues + 1,
+				sizeof(*dev->wb.qctx), GFP_KERNEL);
+		if (!dev->wb.qctx)
+			return -ENOMEM;
+	}
+
+	dev->wb.nr_io_queues_layout = nr_io_queues;
+	dev->wb.hmb_l2p_bytes = l2_bytes;
+	dev->wb.hmb_wb_base = l2_end;
+	dev->wb.hmb_wb_bytes = wb_total_bytes;
+
+	for (qid = 1; qid <= nr_io_queues; qid++) {
+		struct nvme_wb_queue_ctx *qctx = &dev->wb.qctx[qid];
+		u64 q_pages = pages_per_q;
+		u64 q_off;
+		u64 q_bytes;
+		char name[32];
+
+		if (qid == nr_io_queues)
+			q_pages += wb_total_pages - pages_per_q * nr_io_queues;
+
+		q_off = dev->wb.hmb_wb_base + cursor_pages * page_sz;
+		q_bytes = q_pages * page_sz;
+
+		qctx->wb_off = q_off;
+		qctx->wb_bytes = q_bytes - mcp_bytes_aligned;
+		qctx->mcp_off = q_off + qctx->wb_bytes;
+		qctx->mcp_capacity = mcp_bytes_aligned / NVME_WB_MCP_ENTRY_BYTES;
+		qctx->mcp_head = 0;
+
+		if (!qctx->wq) {
+			snprintf(name, sizeof(name), "nvme-wb-q%u", qid);
+			qctx->wq = alloc_workqueue(name, WQ_UNBOUND | WQ_MEM_RECLAIM, 1);
+			if (!qctx->wq)
+				return -ENOMEM;
+			spin_lock_init(&qctx->lock);
+			INIT_LIST_HEAD(&qctx->pending);
+		}
+
+		cursor_pages += q_pages;
+	}
+
+	dev_info(dev->ctrl.device,
+		"[WB-HOST][3A] layout from host formula: HMB=%llu L2=%llu WB_BASE=0x%llx WB_BYTES=%llu Q=%u MCP_ENTRIES=%u\n",
+		dev->host_mem_size, dev->wb.hmb_l2p_bytes,
+		dev->wb.hmb_wb_base, dev->wb.hmb_wb_bytes,
+		nr_io_queues, NVME_WB_MCP_ENTRIES_PER_Q);
+	return 0;
+}
+
+static void nvme_wb_try_push_kva_mapping(struct nvme_dev *dev,
+		const char *reason)
+{
+	struct nvme_command cmd = { };
+	struct nvme_wb_kva_push_entry *entries;
+	u32 i;
+	u32 chunk_count;
+	u32 buf_size;
+	int ret;
+
+	if (!dev->hmb || !dev->host_mem_descs || !dev->host_mem_desc_bufs)
+		return;
+
+	ret = nvme_wb_setup_layout_and_workers(dev);
+	if (ret) {
+		if (ret != -EAGAIN)
+			dev_warn(dev->ctrl.device,
+				"[WB-HOST][2B] layout init deferred/failed reason=%s ret=%d\n",
+				reason, ret);
+		return;
+	}
+
+	chunk_count = dev->nr_host_mem_descs;
+	if (!chunk_count)
+		return;
+
+	buf_size = chunk_count * sizeof(*entries);
+	entries = kcalloc(chunk_count, sizeof(*entries), GFP_KERNEL);
+	if (!entries)
+		return;
+
+	for (i = 0; i < chunk_count; i++) {
+		entries[i].gpa = dev->host_mem_descs[i].addr;
+		entries[i].kva = cpu_to_le64((u64)(uintptr_t)dev->host_mem_desc_bufs[i]);
+	}
+
+	cmd.common.opcode = NVME_WB_ADM_KVA_MAPPING_PUSH;
+	cmd.common.nsid = cpu_to_le32(0);
+	cmd.common.cdw10 = cpu_to_le32(0x1 | ((chunk_count & 0x3fff) << 2));
+	cmd.common.cdw11 = cpu_to_le32(++dev->wb.kva_seq);
+	cmd.common.cdw14 = cpu_to_le32(buf_size);
+
+	/*
+	 * Q2B: resend mapping after every successful HMB enable/reset path.
+	 * NOTE: controller side in this workspace may still use old opcodes.
+	 * Host follows corrected protocol mapping requested by user.
+	 */
+	ret = nvme_submit_sync_cmd(dev->ctrl.admin_q, &cmd, entries, buf_size);
+	if (ret) {
+		dev_warn(dev->ctrl.device,
+			"[WB-HOST][2B] KVA mapping push failed reason=%s opcode=0x%x seq=%u ret=%d (controller opcode mismatch risk if not updated)\n",
+			reason, NVME_WB_ADM_KVA_MAPPING_PUSH, dev->wb.kva_seq, ret);
+		dev->wb.host_enabled = false;
+		dev->wb.map_pushed = false;
+		atomic64_inc(&dev->wb.fallback_cnt);
+	} else {
+		dev->wb.host_enabled = true;
+		dev->wb.map_pushed = true;
+		dev_info(dev->ctrl.device,
+			"[WB-HOST][2B][3A][4B][5A][6A][7A][8A][9A][10A][11A][12A][13A] mapping pushed opcode=0x%x seq=%u chunks=%u reason=%s\n",
+			NVME_WB_ADM_KVA_MAPPING_PUSH, dev->wb.kva_seq,
+			chunk_count, reason);
+	}
+
+	kfree(entries);
+}
+
+static void nvme_wb_try_complete_deferred(struct nvme_dev *dev,
+		struct request *req, struct nvme_completion *cqe, u16 qid)
+{
+	struct nvme_wb_work_item *item;
+	struct nvme_wb_queue_ctx *qctx;
+	unsigned long flags;
+	u8 opcode;
+
+	if (!dev->wb.host_enabled || !dev->wb.map_pushed || !dev->wb.qctx)
+		goto complete_now;
+
+	/*
+	 * Q14A accepted risk (documented): controller may fallback specific read
+	 * paths when MCP space is insufficient. If write data is still only in WB
+	 * and controller-side fallback policy serves from NAND, stale-read windows
+	 * may exist. This host path does not attempt to mask or recover that class
+	 * of controller policy risk; it only implements protocol plumbing and
+	 * fail-fast observability for malformed MCP/control flow.
+	 */
+
+	if (!qid || qid > dev->wb.nr_io_queues_layout)
+		goto complete_now;
+
+	opcode = nvme_req(req)->cmd->common.opcode;
+	if (opcode != nvme_cmd_write && opcode != nvme_cmd_read)
+		goto complete_now;
+
+	if ((le64_to_cpu(cqe->result.u64) & NVME_WB_CQE_MCP_READY_MASK) == 0)
+		goto complete_now;
+
+	if (unlikely(le16_to_cpu(cqe->status) >> 1))
+		goto complete_now;
+
+	item = kzalloc(sizeof(*item), GFP_ATOMIC);
+	if (!item)
+		goto complete_now;
+
+	item->req = req;
+	item->qid = qid;
+	item->cmd_id = le16_to_cpu(cqe->command_id);
+	item->is_write = opcode == nvme_cmd_write;
+	INIT_WORK(&item->work, nvme_wb_workfn);
+	INIT_LIST_HEAD(&item->node);
+
+	nvme_req(req)->status = 0;
+	nvme_req(req)->result = cqe->result;
+
+	qctx = &dev->wb.qctx[qid];
+	spin_lock_irqsave(&qctx->lock, flags);
+	list_add_tail(&item->node, &qctx->pending);
+	spin_unlock_irqrestore(&qctx->lock, flags);
+
+	atomic64_inc(&dev->wb.mcp_ready_cnt);
+	queue_work(qctx->wq, &item->work);
+	return;
+
+complete_now:
+	if (!nvme_try_complete_req(req, cqe->status, cqe->result))
+		nvme_pci_complete_rq(req);
+}
+
 static int nvme_set_host_mem(struct nvme_dev *dev, u32 bits)
 {
 	u32 host_mem_size = dev->host_mem_size >> NVME_CTRL_PAGE_SHIFT;
@@ -1906,8 +2595,11 @@ static int nvme_set_host_mem(struct nvme_dev *dev, u32 bits)
 		dev_warn(dev->ctrl.device,
 			 "failed to set host mem (err %d, flags %#x).\n",
 			 ret, bits);
-	} else
+	} else {
 		dev->hmb = bits & NVME_HOST_MEM_ENABLE;
+		if (!dev->hmb)
+			nvme_wb_host_reset(dev, true);
+	}
 
 	return ret;
 }
@@ -1922,8 +2614,10 @@ static void nvme_free_host_mem(struct nvme_dev *dev)
 
 		dma_free_attrs(dev->dev, size, dev->host_mem_desc_bufs[i],
 			       le64_to_cpu(desc->addr),
-			       DMA_ATTR_NO_KERNEL_MAPPING | DMA_ATTR_NO_WARN);
+			       DMA_ATTR_NO_WARN);
 	}
+
+	nvme_wb_host_reset(dev, true);
 
 	kfree(dev->host_mem_desc_bufs);
 	dev->host_mem_desc_bufs = NULL;
@@ -1966,7 +2660,7 @@ static int __nvme_alloc_host_mem(struct nvme_dev *dev, u64 preferred,
 
 		len = min_t(u64, chunk_size, preferred - size);
 		bufs[i] = dma_alloc_attrs(dev->dev, len, &dma_addr, GFP_KERNEL,
-				DMA_ATTR_NO_KERNEL_MAPPING | DMA_ATTR_NO_WARN);
+				DMA_ATTR_NO_WARN);
 		if (!bufs[i])
 			break;
 
@@ -1992,7 +2686,7 @@ out_free_bufs:
 
 		dma_free_attrs(dev->dev, size, bufs[i],
 			       le64_to_cpu(descs[i].addr),
-			       DMA_ATTR_NO_KERNEL_MAPPING | DMA_ATTR_NO_WARN);
+			       DMA_ATTR_NO_WARN);
 	}
 
 	kfree(bufs);
@@ -2061,8 +2755,11 @@ static int nvme_setup_host_mem(struct nvme_dev *dev)
 	}
 
 	ret = nvme_set_host_mem(dev, enable_bits);
-	if (ret)
+	if (ret) {
 		nvme_free_host_mem(dev);
+	} else if (dev->hmb) {
+		nvme_wb_try_push_kva_mapping(dev, "hmb-enable");
+	}
 	return ret;
 }
 
@@ -2817,6 +3514,9 @@ static void nvme_reset_work(struct work_struct *work)
 	if (result)
 		goto out;
 
+	if (dev->hmb)
+		nvme_wb_try_push_kva_mapping(dev, "post-io-queues");
+
 	/*
 	 * Keep the controller around but remove all namespaces if we don't have
 	 * any working I/O queue.
@@ -3024,6 +3724,11 @@ static struct nvme_dev *nvme_pci_alloc_dev(struct pci_dev *pdev,
 	INIT_WORK(&dev->ctrl.reset_work, nvme_reset_work);
 	INIT_WORK(&dev->remove_work, nvme_remove_dead_ctrl_work);
 	mutex_init(&dev->shutdown_lock);
+	atomic64_set(&dev->wb.mcp_ready_cnt, 0);
+	atomic64_set(&dev->wb.mcp_parse_fail_cnt, 0);
+	atomic64_set(&dev->wb.copy_done_submit_cnt, 0);
+	atomic64_set(&dev->wb.read_done_submit_cnt, 0);
+	atomic64_set(&dev->wb.fallback_cnt, 0);
 
 	dev->nr_write_queues = write_queues;
 	dev->nr_poll_queues = poll_queues;
