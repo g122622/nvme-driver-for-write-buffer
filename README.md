@@ -31,7 +31,7 @@ ls -l /lib/modules/$(uname -r)/build  # 应该指向头文件目录
 
 ```
 
-## 检出指定版本内核源码
+## 获取指定版本内核源码
 
 需要注意version magic对不上会拒绝加载编译出来的内核模块。
 
@@ -40,7 +40,10 @@ sudo apt install linux-source-5.15.0 -y
 
 cd /usr/src
 sudo tar -xf linux-source-5.15.0.tar.bz2 # 解压
-cd linux-source-5.15.
+
+# 然后把这个仓库patch进去
+# 。。。
+
 ```
 
 ## 编译内核模块
