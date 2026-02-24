@@ -125,6 +125,7 @@ static bool __nvme_disable_io_queues(struct nvme_dev *dev, u8 opcode);
 #define NVME_WB_ALIGN_BYTES		4096ULL
 #define NVME_WB_MCP_ENTRY_BYTES		64U
 #define NVME_WB_MCP_ENTRIES_PER_Q	1024U
+#define NVME_WB_NOTIFY_RESERVED_TAGS	8
 
 /* Controller encodes MCP_READY in CQE DW1 bit0 => result.u64 bit32 on host. */
 #define NVME_WB_CQE_MCP_READY_MASK	(1ULL << 32)
@@ -2103,46 +2104,21 @@ static int nvme_wb_copy_req_payload(struct request *req, u32 req_off,
 	return left ? -EINVAL : 0;
 }
 
-static void nvme_wb_notify_endio(struct request *req, blk_status_t error)
-{
-	blk_mq_free_request(req);
-}
-
-static struct request *nvme_wb_alloc_io_req_qid(struct request_queue *q,
-		struct nvme_command *cmd, u16 qid)
-{
-	struct request *req;
-
-	req = blk_mq_alloc_request_hctx(q, REQ_OP_DRV_OUT,
-			BLK_MQ_REQ_NOWAIT, qid ? qid - 1 : 0);
-	if (IS_ERR(req))
-		return req;
-
-	if (req->q->queuedata)
-		req->timeout = NVME_IO_TIMEOUT;
-	else
-		req->timeout = NVME_ADMIN_TIMEOUT;
-
-	cmd->common.flags &= ~NVME_CMD_SGL_ALL;
-	req->cmd_flags |= REQ_FAILFAST_DRIVER;
-	if (req->mq_hctx->type == HCTX_TYPE_POLL)
-		req->cmd_flags |= REQ_HIPRI;
-
-	nvme_req(req)->status = 0;
-	nvme_req(req)->retries = 0;
-	nvme_req(req)->flags = 0;
-	req->rq_flags |= RQF_DONTPREP;
-	memcpy(nvme_req(req)->cmd, cmd, sizeof(*cmd));
-
-	return req;
-}
-
-/* Q8A/Q9A: fire-and-forget submit on the original qid. */
-static void nvme_wb_submit_notify(struct nvme_dev *dev, struct request *orig,
+/*
+ * Reliable notify delivery (qid-pinned).
+ *
+ * We previously used best-effort async submission from worker context and
+ * dropped notifies when request allocation failed. That caused controller-side
+ * MCP release gaps and eventual metadata/data inconsistency under pressure.
+ *
+ * Use qid-pinned synchronous submit to guarantee delivery ordering for
+ * 0xd5/0xd9 relative to MCP consumption.
+ */
+static int nvme_wb_submit_notify(struct nvme_dev *dev, struct request *orig,
 		u16 qid, u16 cmd_id, u32 seg_cnt, bool is_write)
 {
 	struct nvme_command cmd = { };
-	struct request *req;
+	int ret;
 
 	cmd.common.opcode = is_write ? NVME_WB_IO_NOTIFY_COPY_DONE :
 		NVME_WB_IO_NOTIFY_READ_DONE;
@@ -2151,13 +2127,14 @@ static void nvme_wb_submit_notify(struct nvme_dev *dev, struct request *orig,
 	cmd.common.cdw11 = cpu_to_le32(qid);
 	cmd.common.cdw12 = cpu_to_le32(seg_cnt);
 
-	req = nvme_wb_alloc_io_req_qid(orig->q, &cmd, qid);
-	if (IS_ERR(req)) {
+	ret = __nvme_submit_sync_cmd(orig->q, &cmd, NULL, NULL, 0,
+			0, qid, 0, 0);
+	if (ret) {
 		dev_warn(dev->ctrl.device,
-			"[WB-HOST][8A][9A] notify submit alloc failed qid=%u cmd_id=%u seg_cnt=%u op=0x%x\n",
-			qid, cmd_id, seg_cnt, cmd.common.opcode);
+			"[WB-HOST][8A][9A] notify submit failed qid=%u cmd_id=%u seg_cnt=%u op=0x%x ret=%d\n",
+			qid, cmd_id, seg_cnt, cmd.common.opcode, ret);
 		atomic64_inc(&dev->wb.fallback_cnt);
-		return;
+		return ret;
 	}
 
 	if (is_write)
@@ -2165,7 +2142,7 @@ static void nvme_wb_submit_notify(struct nvme_dev *dev, struct request *orig,
 	else
 		atomic64_inc(&dev->wb.read_done_submit_cnt);
 
-	blk_execute_rq_nowait(NULL, req, false, nvme_wb_notify_endio);
+	return 0;
 }
 
 static void nvme_wb_finish_req_fail(struct nvme_dev *dev, struct request *req)
@@ -2275,8 +2252,11 @@ static void nvme_wb_workfn(struct work_struct *work)
 		goto out_free;
 	}
 
-	nvme_wb_submit_notify(dev, req, item->qid, item->cmd_id,
-			seg_cnt, item->is_write);
+	if (nvme_wb_submit_notify(dev, req, item->qid, item->cmd_id,
+			seg_cnt, item->is_write)) {
+		nvme_wb_finish_req_fail(dev, req);
+		goto out_free;
+	}
 	nvme_pci_complete_rq(req);
 
 out_free:
@@ -3156,6 +3136,16 @@ static void nvme_dev_add(struct nvme_dev *dev)
 		 */
 		if (dev->ctrl.quirks & NVME_QUIRK_SHARED_TAGS)
 			dev->tagset.reserved_tags = NVME_AQ_DEPTH;
+
+		/*
+		 * WB host notify path submits queue-bound fire-and-forget I/O
+		 * commands (0xd5/0xd9) from worker context via
+		 * blk_mq_alloc_request_hctx(), which requires RESERVED tags.
+		 * Keep a small reserved pool even on non-shared-tag controllers.
+		 */
+		dev->tagset.reserved_tags = max_t(unsigned int,
+				dev->tagset.reserved_tags,
+				NVME_WB_NOTIFY_RESERVED_TAGS);
 
 		ret = blk_mq_alloc_tag_set(&dev->tagset);
 		if (ret) {

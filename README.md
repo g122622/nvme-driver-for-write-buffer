@@ -74,4 +74,7 @@ ssh -p 8080 g122622@localhost
 
 ```bash
 sudo dmesg | tail -20
+
+# 实时
+sudo dmesg -w
 ```
