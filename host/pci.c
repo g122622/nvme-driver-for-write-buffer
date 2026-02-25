@@ -2128,7 +2128,8 @@ static int nvme_wb_submit_notify(struct nvme_dev *dev, struct request *orig,
 	cmd.common.cdw12 = cpu_to_le32(seg_cnt);
 
 	ret = __nvme_submit_sync_cmd(orig->q, &cmd, NULL, NULL, 0,
-			0, qid, 0, 0);
+			0, qid, 0,
+			BLK_MQ_REQ_NOWAIT | BLK_MQ_REQ_RESERVED);
 	if (ret) {
 		dev_warn(dev->ctrl.device,
 			"[WB-HOST][8A][9A] notify submit failed qid=%u cmd_id=%u seg_cnt=%u op=0x%x ret=%d\n",

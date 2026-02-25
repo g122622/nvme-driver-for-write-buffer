@@ -25,7 +25,7 @@ sudo apt install -y \
     bc \
     kmod
 
-# 检查头文件是否安装正确
+# 看下头文件全了没
 ls -l /usr/src/linux-headers-$(uname -r)/
 ls -l /lib/modules/$(uname -r)/build  # 应该指向头文件目录
 
@@ -42,7 +42,7 @@ cd /usr/src
 sudo tar -xf linux-source-5.15.0.tar.bz2 # 解压
 
 # 然后把这个仓库patch进去
-# 。。。
+# 略
 
 ```
 
@@ -60,6 +60,50 @@ make -C /lib/modules/$(uname -r)/build M=$(pwd) modules
 cd /usr/src/linux-source-5.15.0/drivers/nvme/host
 sudo rmmod nvme
 sudo insmod ./nvme.ko
+```
+
+## 测试
+
+fio随机写
+
+```bash
+sudo fio --name=test --filename=/dev/nvme0n1 \
+    --direct=1 --rw=randwrite --bs=4k \
+    --ioengine=libaio --iodepth=32 \
+    --numjobs=4 --size=1G \
+    --group_reporting
+```
+
+fio全盘随机读
+
+```bash
+sudo fio --name=test --filename=/dev/nvme0n1 \
+    --direct=1 --rw=randread --bs=4k \
+    --ioengine=libaio --iodepth=32 \
+    --numjobs=4 --time_based --runtime=30 \
+    --group_reporting
+```
+
+挂载ext4
+
+```bash
+sudo lsblk -o NAME,SIZE,FSTYPE,MOUNTPOINT /dev/nvme0n1
+
+# 分区表
+sudo parted -s /dev/nvme0n1 mklabel gpt
+sudo parted -s /dev/nvme0n1 mkpart primary ext4 1MiB 100%
+sudo partprobe /dev/nvme0n1
+
+sudo mkfs.ext4 -F /dev/nvme0n1p1 # 格式化
+
+# 挂载
+sudo mkdir -p /mnt/femu
+sudo mount /dev/nvme0n1p1 /mnt/femu
+
+# 随便写点文件测试
+echo "hello world" | sudo tee /mnt/femu/hello.txt > /dev/null
+sudo sync
+sudo cat /mnt/femu/hello.txt
 ```
 
 ## 常用命令
