@@ -27,6 +27,7 @@
 #include <linux/sed-opal.h>
 #include <linux/pci-p2pdma.h>
 #include <linux/highmem.h>
+#include <linux/math64.h>
 #include <linux/ktime.h>
 #include <linux/workqueue.h>
 
@@ -2092,6 +2093,13 @@ static void nvme_wb_perf_log_if_due(struct nvme_dev *dev)
 	u64 d_mcp_read_ns, d_parse_ns, d_copy_ns, d_notify_ns, d_complete_ns;
 	u64 d_mcp_ready, d_mcp_parse_fail, d_copy_done_submit;
 	u64 d_read_done_submit, d_fallback;
+	u64 avg_ns, mcp_read_ns, parse_ns, copy_ns, notify_ns, complete_ns;
+	u64 avg_us_int = 0, avg_us_frac = 0;
+	u64 mcp_read_us_int = 0, mcp_read_us_frac = 0;
+	u64 parse_us_int = 0, parse_us_frac = 0;
+	u64 copy_us_int = 0, copy_us_frac = 0;
+	u64 notify_us_int = 0, notify_us_frac = 0;
+	u64 complete_us_int = 0, complete_us_frac = 0;
 	u64 cur_work_calls, cur_work_ns, cur_work_segs, cur_work_bytes;
 	u64 cur_mcp_read_ns, cur_parse_ns, cur_copy_ns, cur_notify_ns;
 	u64 cur_complete_ns;
@@ -2139,17 +2147,39 @@ static void nvme_wb_perf_log_if_due(struct nvme_dev *dev)
 	d_read_done_submit = cur_read_done_submit - wb->perf_last_read_done_submit_cnt;
 	d_fallback = cur_fallback - wb->perf_last_fallback_cnt;
 
+	if (d_work_calls) {
+		avg_ns = div64_u64(d_work_ns, d_work_calls);
+		mcp_read_ns = div64_u64(d_mcp_read_ns, d_work_calls);
+		parse_ns = div64_u64(d_parse_ns, d_work_calls);
+		copy_ns = div64_u64(d_copy_ns, d_work_calls);
+		notify_ns = div64_u64(d_notify_ns, d_work_calls);
+		complete_ns = div64_u64(d_complete_ns, d_work_calls);
+
+		avg_us_int = div64_u64(avg_ns, 1000);
+		avg_us_frac = div64_u64(avg_ns % 1000, 10);
+		mcp_read_us_int = div64_u64(mcp_read_ns, 1000);
+		mcp_read_us_frac = div64_u64(mcp_read_ns % 1000, 10);
+		parse_us_int = div64_u64(parse_ns, 1000);
+		parse_us_frac = div64_u64(parse_ns % 1000, 10);
+		copy_us_int = div64_u64(copy_ns, 1000);
+		copy_us_frac = div64_u64(copy_ns % 1000, 10);
+		notify_us_int = div64_u64(notify_ns, 1000);
+		notify_us_frac = div64_u64(notify_ns % 1000, 10);
+		complete_us_int = div64_u64(complete_ns, 1000);
+		complete_us_frac = div64_u64(complete_ns % 1000, 10);
+	}
+
 	dev_info(dev->ctrl.device,
-		"[WB-HOST] wb_work perf(1s): calls=%llu segs=%llu bytes=%llu avg=%.2fus | mcp_read=%.2fus parse=%.2fus copy=%.2fus notify=%.2fus complete=%.2fus | mcp_ready=%llu parse_fail=%llu copy_done=%llu read_done=%llu fallback=%llu\n",
+		"[WB-HOST] wb_work perf(1s): calls=%llu segs=%llu bytes=%llu avg=%llu.%02lluus | mcp_read=%llu.%02lluus parse=%llu.%02lluus copy=%llu.%02lluus notify=%llu.%02lluus complete=%llu.%02lluus | mcp_ready=%llu parse_fail=%llu copy_done=%llu read_done=%llu fallback=%llu\n",
 		d_work_calls,
 		d_work_segs,
 		d_work_bytes,
-		d_work_calls ? (double)d_work_ns / (double)d_work_calls / 1000.0 : 0.0,
-		d_work_calls ? (double)d_mcp_read_ns / (double)d_work_calls / 1000.0 : 0.0,
-		d_work_calls ? (double)d_parse_ns / (double)d_work_calls / 1000.0 : 0.0,
-		d_work_calls ? (double)d_copy_ns / (double)d_work_calls / 1000.0 : 0.0,
-		d_work_calls ? (double)d_notify_ns / (double)d_work_calls / 1000.0 : 0.0,
-		d_work_calls ? (double)d_complete_ns / (double)d_work_calls / 1000.0 : 0.0,
+		avg_us_int, avg_us_frac,
+		mcp_read_us_int, mcp_read_us_frac,
+		parse_us_int, parse_us_frac,
+		copy_us_int, copy_us_frac,
+		notify_us_int, notify_us_frac,
+		complete_us_int, complete_us_frac,
 		d_mcp_ready,
 		d_mcp_parse_fail,
 		d_copy_done_submit,
