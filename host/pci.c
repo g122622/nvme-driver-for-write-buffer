@@ -51,7 +51,7 @@ static bool use_cmb_sqes = true;
 module_param(use_cmb_sqes, bool, 0444);
 MODULE_PARM_DESC(use_cmb_sqes, "use controller's memory buffer for I/O SQes");
 
-static unsigned int max_host_mem_size_mb = 128;
+static unsigned int max_host_mem_size_mb = 4096;
 module_param(max_host_mem_size_mb, uint, 0444);
 MODULE_PARM_DESC(max_host_mem_size_mb,
 	"Maximum Host Memory Buffer (HMB) size per controller (in MiB)");
@@ -121,10 +121,10 @@ static bool __nvme_disable_io_queues(struct nvme_dev *dev, u8 opcode);
 #define NVME_WB_IO_NOTIFY_READ_DONE	0xd9
 
 /* Keep in sync with controller-side config (FEMU common/l2p-cache-config.h). */
-#define NVME_WB_L2P_L2_SIZE_KB		(16 * 1024)
+#define NVME_WB_L2P_L2_SIZE_KB		(16 * 512 * 0)
 #define NVME_WB_ALIGN_BYTES		4096ULL
 #define NVME_WB_MCP_ENTRY_BYTES		64U
-#define NVME_WB_MCP_ENTRIES_PER_Q	1024U
+#define NVME_WB_MCP_ENTRIES_PER_Q	65536U
 #define NVME_WB_NOTIFY_RESERVED_TAGS	8
 
 /* Controller encodes MCP_READY in CQE DW1 bit0 => result.u64 bit32 on host. */
@@ -2132,7 +2132,7 @@ static int nvme_wb_submit_notify(struct nvme_dev *dev, struct request *orig,
 			BLK_MQ_REQ_NOWAIT | BLK_MQ_REQ_RESERVED);
 	if (ret) {
 		dev_warn(dev->ctrl.device,
-			"[WB-HOST][8A][9A] notify submit failed qid=%u cmd_id=%u seg_cnt=%u op=0x%x ret=%d\n",
+			"[WB-HOST] notify submit failed qid=%u cmd_id=%u seg_cnt=%u op=0x%x ret=%d\n",
 			qid, cmd_id, seg_cnt, cmd.common.opcode, ret);
 		atomic64_inc(&dev->wb.fallback_cnt);
 		return ret;
@@ -2183,7 +2183,7 @@ static void nvme_wb_workfn(struct work_struct *work)
 
 		if (!nvme_wb_read_mcp_entry(dev, qctx, qctx->mcp_head, &e)) {
 			dev_warn(dev->ctrl.device,
-				"[WB-HOST][7A] mcp read failed qid=%u head=%u\n",
+				"[WB-HOST] mcp read failed qid=%u head=%u\n",
 				item->qid, qctx->mcp_head);
 			atomic64_inc(&dev->wb.mcp_parse_fail_cnt);
 			nvme_wb_finish_req_fail(dev, req);
@@ -2200,7 +2200,7 @@ static void nvme_wb_workfn(struct work_struct *work)
 			     le32_to_cpu(e.metadata_size) != NVME_WB_MCP_ENTRY_BYTES ||
 			     !len || !hmb_vaddr)) {
 			dev_warn(dev->ctrl.device,
-				"[WB-HOST][7A][9A] mcp parse fail qid=%u head=%u exp(cmd=%u qid=%u) got(cmd=%u qid=%u md=%u len=%u kva=0x%llx)\n",
+				"[WB-HOST] mcp parse fail qid=%u head=%u exp(cmd=%u qid=%u) got(cmd=%u qid=%u md=%u len=%u kva=0x%llx)\n",
 				item->qid, qctx->mcp_head,
 				item->cmd_id, item->qid,
 				cmd_id, qid,
@@ -2213,7 +2213,7 @@ static void nvme_wb_workfn(struct work_struct *work)
 
 		if (item->is_write && e.type != NVME_WB_MCP_TYPE_WRITE_ALLOC) {
 			dev_warn(dev->ctrl.device,
-				"[WB-HOST][7A] type mismatch(write) qid=%u cmd_id=%u type=%u\n",
+				"[WB-HOST] type mismatch(write) qid=%u cmd_id=%u type=%u\n",
 				item->qid, item->cmd_id, e.type);
 			atomic64_inc(&dev->wb.mcp_parse_fail_cnt);
 			nvme_wb_finish_req_fail(dev, req);
@@ -2221,7 +2221,7 @@ static void nvme_wb_workfn(struct work_struct *work)
 		}
 		if (!item->is_write && e.type != NVME_WB_MCP_TYPE_READ_HIT) {
 			dev_warn(dev->ctrl.device,
-				"[WB-HOST][7A] type mismatch(read) qid=%u cmd_id=%u type=%u\n",
+				"[WB-HOST] type mismatch(read) qid=%u cmd_id=%u type=%u\n",
 				item->qid, item->cmd_id, e.type);
 			atomic64_inc(&dev->wb.mcp_parse_fail_cnt);
 			nvme_wb_finish_req_fail(dev, req);
@@ -2232,7 +2232,7 @@ static void nvme_wb_workfn(struct work_struct *work)
 			(void *)(uintptr_t)hmb_vaddr, len, item->is_write);
 		if (ret) {
 			dev_warn(dev->ctrl.device,
-				"[WB-HOST][7A][11A] payload copy failed qid=%u cmd_id=%u off=%u len=%u err=%d\n",
+				"[WB-HOST] payload copy failed qid=%u cmd_id=%u off=%u len=%u err=%d\n",
 				item->qid, item->cmd_id, off, len, ret);
 			atomic64_inc(&dev->wb.mcp_parse_fail_cnt);
 			nvme_wb_finish_req_fail(dev, req);
@@ -2247,7 +2247,7 @@ static void nvme_wb_workfn(struct work_struct *work)
 	/* Q6A: always report full seg_cnt per command in a single notify. */
 	if (!seg_cnt) {
 		dev_warn(dev->ctrl.device,
-			"[WB-HOST][6A] seg_cnt=0 qid=%u cmd_id=%u\n",
+			"[WB-HOST] seg_cnt=0 qid=%u cmd_id=%u\n",
 			item->qid, item->cmd_id);
 		nvme_wb_finish_req_fail(dev, req);
 		goto out_free;
@@ -2350,7 +2350,7 @@ static int nvme_wb_setup_layout_and_workers(struct nvme_dev *dev)
 	/* Q4B: use queue_count-1 to match chosen policy. */
 	nr_io_queues = dev->ctrl.queue_count > 1 ? dev->ctrl.queue_count - 1 : 0;
 	dev_info(dev->ctrl.device,
-		"[WB-HOST][4B] layout uses ctrl.queue_count-1: queue_count=%u nr_io_queues=%u\n",
+		"[WB-HOST] layout uses ctrl.queue_count-1: queue_count=%u nr_io_queues=%u\n",
 		dev->ctrl.queue_count, nr_io_queues);
 
 	if (!nr_io_queues)
@@ -2421,7 +2421,7 @@ static int nvme_wb_setup_layout_and_workers(struct nvme_dev *dev)
 	}
 
 	dev_info(dev->ctrl.device,
-		"[WB-HOST][3A] layout from host formula: HMB=%llu L2=%llu WB_BASE=0x%llx WB_BYTES=%llu Q=%u MCP_ENTRIES=%u\n",
+		"[WB-HOST] layout from host formula: HMB=%llu L2=%llu WB_BASE=0x%llx WB_BYTES=%llu Q=%u MCP_ENTRIES=%u\n",
 		dev->host_mem_size, dev->wb.hmb_l2p_bytes,
 		dev->wb.hmb_wb_base, dev->wb.hmb_wb_bytes,
 		nr_io_queues, NVME_WB_MCP_ENTRIES_PER_Q);
@@ -2445,7 +2445,7 @@ static void nvme_wb_try_push_kva_mapping(struct nvme_dev *dev,
 	if (ret) {
 		if (ret != -EAGAIN)
 			dev_warn(dev->ctrl.device,
-				"[WB-HOST][2B] layout init deferred/failed reason=%s ret=%d\n",
+				"[WB-HOST] layout init deferred/failed reason=%s ret=%d\n",
 				reason, ret);
 		return;
 	}
@@ -2478,7 +2478,7 @@ static void nvme_wb_try_push_kva_mapping(struct nvme_dev *dev,
 	ret = nvme_submit_sync_cmd(dev->ctrl.admin_q, &cmd, entries, buf_size);
 	if (ret) {
 		dev_warn(dev->ctrl.device,
-			"[WB-HOST][2B] KVA mapping push failed reason=%s opcode=0x%x seq=%u ret=%d (controller opcode mismatch risk if not updated)\n",
+			"[WB-HOST] KVA mapping push failed reason=%s opcode=0x%x seq=%u ret=%d (controller opcode mismatch risk if not updated)\n",
 			reason, NVME_WB_ADM_KVA_MAPPING_PUSH, dev->wb.kva_seq, ret);
 		dev->wb.host_enabled = false;
 		dev->wb.map_pushed = false;
@@ -2487,7 +2487,7 @@ static void nvme_wb_try_push_kva_mapping(struct nvme_dev *dev,
 		dev->wb.host_enabled = true;
 		dev->wb.map_pushed = true;
 		dev_info(dev->ctrl.device,
-			"[WB-HOST][2B][3A][4B][5A][6A][7A][8A][9A][10A][11A][12A][13A] mapping pushed opcode=0x%x seq=%u chunks=%u reason=%s\n",
+			"[WB-HOST] mapping pushed opcode=0x%x seq=%u chunks=%u reason=%s\n",
 			NVME_WB_ADM_KVA_MAPPING_PUSH, dev->wb.kva_seq,
 			chunk_count, reason);
 	}
