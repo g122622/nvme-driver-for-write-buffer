@@ -155,7 +155,7 @@ static bool __nvme_disable_io_queues(struct nvme_dev *dev, u8 opcode);
 #define NVME_WB_MCP_F_LAST_SEG		(1U << 0)
 
 #ifndef NVME_WB_HOST_PERF_ENABLE
-#define NVME_WB_HOST_PERF_ENABLE	1
+#define NVME_WB_HOST_PERF_ENABLE	0
 #endif
 
 struct nvme_wb_kva_push_entry {
