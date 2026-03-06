@@ -154,6 +154,10 @@ static bool __nvme_disable_io_queues(struct nvme_dev *dev, u8 opcode);
 #define NVME_WB_MCP_TYPE_READ_HIT	1
 #define NVME_WB_MCP_F_LAST_SEG		(1U << 0)
 
+#ifndef NVME_WB_HOST_PERF_ENABLE
+#define NVME_WB_HOST_PERF_ENABLE	1
+#endif
+
 struct nvme_wb_kva_push_entry {
 	__le64 gpa;
 	__le64 kva;
@@ -2150,6 +2154,7 @@ static bool nvme_wb_read_mcp_entry(struct nvme_dev *dev,
 	return nvme_wb_hmb_memcpy(dev, off, entry, sizeof(*entry), false);
 }
 
+#if NVME_WB_HOST_PERF_ENABLE
 static void nvme_wb_perf_log_if_due(struct nvme_dev *dev)
 {
 	struct nvme_wb_ctx *wb = &dev->wb;
@@ -2164,6 +2169,8 @@ static void nvme_wb_perf_log_if_due(struct nvme_dev *dev)
 	u64 d_read_done_submit, d_fallback;
 	u64 avg_ns, queue_wait_ns, mcp_read_ns, parse_ns, copy_ns;
 	u64 notify_qwait_ns, notify_ns, complete_ns;
+	u64 notify_qwait_batch_ns = 0, notify_qwait_entry_ns = 0;
+	u64 notify_submit_per_entry_ns = 0;
 	u64 notify_batch_fill_x100 = 0;
 	u64 avg_us_int = 0, avg_us_frac = 0;
 	u64 queue_wait_us_int = 0, queue_wait_us_frac = 0;
@@ -2171,7 +2178,10 @@ static void nvme_wb_perf_log_if_due(struct nvme_dev *dev)
 	u64 parse_us_int = 0, parse_us_frac = 0;
 	u64 copy_us_int = 0, copy_us_frac = 0;
 	u64 notify_qwait_us_int = 0, notify_qwait_us_frac = 0;
+	u64 notify_qwait_batch_us_int = 0, notify_qwait_batch_us_frac = 0;
+	u64 notify_qwait_entry_us_int = 0, notify_qwait_entry_us_frac = 0;
 	u64 notify_us_int = 0, notify_us_frac = 0;
+	u64 notify_submit_per_entry_us_int = 0, notify_submit_per_entry_us_frac = 0;
 	u64 complete_us_int = 0, complete_us_frac = 0;
 	u64 notify_batch_fill_int = 0, notify_batch_fill_frac = 0;
 	u64 cur_work_calls, cur_work_ns, cur_work_segs, cur_work_bytes;
@@ -2281,6 +2291,26 @@ static void nvme_wb_perf_log_if_due(struct nvme_dev *dev)
 	}
 
 	if (d_notify_batch_calls) {
+		notify_qwait_batch_ns = div64_u64(d_notify_qwait_ns,
+				d_notify_batch_calls);
+		notify_qwait_batch_us_int = div64_u64(notify_qwait_batch_ns, 1000);
+		notify_qwait_batch_us_frac = div64_u64(notify_qwait_batch_ns % 1000, 10);
+	}
+
+	if (d_notify_batch_entries) {
+		notify_qwait_entry_ns = div64_u64(d_notify_qwait_ns,
+				d_notify_batch_entries);
+		notify_submit_per_entry_ns = div64_u64(d_notify_ns,
+				d_notify_batch_entries);
+		notify_qwait_entry_us_int = div64_u64(notify_qwait_entry_ns, 1000);
+		notify_qwait_entry_us_frac = div64_u64(notify_qwait_entry_ns % 1000, 10);
+		notify_submit_per_entry_us_int =
+			div64_u64(notify_submit_per_entry_ns, 1000);
+		notify_submit_per_entry_us_frac =
+			div64_u64(notify_submit_per_entry_ns % 1000, 10);
+	}
+
+	if (d_notify_batch_calls) {
 		notify_batch_fill_x100 = div64_u64(d_notify_batch_entries * 100,
 				d_notify_batch_calls);
 		notify_batch_fill_int = div64_u64(notify_batch_fill_x100, 100);
@@ -2288,7 +2318,7 @@ static void nvme_wb_perf_log_if_due(struct nvme_dev *dev)
 	}
 
 	dev_info(dev->ctrl.device,
-		"[WB-HOST] wb_work perf(1s): calls=%llu segs=%llu bytes=%llu avg=%llu.%02lluus | queue_wait=%llu.%02lluus mcp_read=%llu.%02lluus parse=%llu.%02lluus copy=%llu.%02lluus complete=%llu.%02lluus | notify_calls=%llu notify_qwait=%llu.%02lluus notify_submit=%llu.%02lluus notify_batch_calls=%llu notify_batch_entries=%llu notify_batch_fill=%llu.%02llu notify_backlog=%llu notify_peak=%llu | mcp_ready=%llu parse_fail=%llu copy_done=%llu read_done=%llu fallback=%llu\n",
+		"[WB-HOST] wb_work perf(1s): calls=%llu segs=%llu bytes=%llu avg=%llu.%02lluus | queue_wait=%llu.%02lluus mcp_read=%llu.%02lluus parse=%llu.%02lluus copy=%llu.%02lluus complete=%llu.%02lluus | notify_calls=%llu notify_qwait_per_call=%llu.%02lluus notify_qwait_per_batch=%llu.%02lluus notify_qwait_per_entry=%llu.%02lluus notify_submit_per_call=%llu.%02lluus notify_submit_per_entry=%llu.%02lluus notify_batch_calls=%llu notify_batch_entries=%llu notify_batch_fill=%llu.%02llu notify_backlog=%llu notify_peak=%llu | mcp_ready=%llu parse_fail=%llu copy_done=%llu read_done=%llu fallback=%llu\n",
 		d_work_calls,
 		d_work_segs,
 		d_work_bytes,
@@ -2300,7 +2330,10 @@ static void nvme_wb_perf_log_if_due(struct nvme_dev *dev)
 		complete_us_int, complete_us_frac,
 		d_notify_calls,
 		notify_qwait_us_int, notify_qwait_us_frac,
+		notify_qwait_batch_us_int, notify_qwait_batch_us_frac,
+		notify_qwait_entry_us_int, notify_qwait_entry_us_frac,
 		notify_us_int, notify_us_frac,
+		notify_submit_per_entry_us_int, notify_submit_per_entry_us_frac,
 		d_notify_batch_calls,
 		d_notify_batch_entries,
 		notify_batch_fill_int, notify_batch_fill_frac,
@@ -2335,6 +2368,12 @@ static void nvme_wb_perf_log_if_due(struct nvme_dev *dev)
 
 	spin_unlock(&wb->perf_lock);
 }
+#else
+static inline void nvme_wb_perf_log_if_due(struct nvme_dev *dev)
+{
+	(void)dev;
+}
+#endif
 
 /*
  * Q11A: this copy helper intentionally targets regular bio-backed I/O path.
@@ -2542,9 +2581,12 @@ static void nvme_wb_notify_workfn(struct work_struct *work)
 			batch_failed = true;
 		}
 		submit_ns += ktime_get_ns() - t_part;
+
+#if NVME_WB_HOST_PERF_ENABLE
 		atomic64_inc(&dev->wb.perf_notify_calls);
 		atomic64_inc(&dev->wb.perf_notify_batch_calls);
 		atomic64_add(d5_cnt, &dev->wb.perf_notify_batch_entries);
+#endif
 	}
 
 	if (d9_cnt && q) {
@@ -2555,7 +2597,10 @@ static void nvme_wb_notify_workfn(struct work_struct *work)
 		t_part = ktime_get_ns();
 		nvme_wb_submit_notify_read(dev, q, it->qid, it->cmd_id, it->seg_cnt);
 		submit_ns += ktime_get_ns() - t_part;
+
+#if NVME_WB_HOST_PERF_ENABLE
 		atomic64_inc(&dev->wb.perf_notify_calls);
+#endif
 	}
 
 	while (!list_empty(&submit_list)) {
@@ -2565,13 +2610,14 @@ static void nvme_wb_notify_workfn(struct work_struct *work)
 		kfree(it);
 	}
 
-	atomic64_add(queue_wait_ns, &dev->wb.perf_notify_queue_wait_ns);
-	atomic64_add(submit_ns, &dev->wb.perf_notify_ns);
-
 	if (d5_cnt && !batch_failed)
 		qctx->batch_cnt = d5_cnt;
 
+#if NVME_WB_HOST_PERF_ENABLE
+	atomic64_add(queue_wait_ns, &dev->wb.perf_notify_queue_wait_ns);
+	atomic64_add(submit_ns, &dev->wb.perf_notify_ns);
 	nvme_wb_perf_log_if_due(dev);
+#endif
 
 	if (need_resched) {
 		unsigned long delay_j = 0;
@@ -2584,6 +2630,11 @@ static void nvme_wb_notify_workfn(struct work_struct *work)
 
 		mod_delayed_work(qctx->notify_wq, &qctx->notify_work, delay_j);
 	}
+
+#if !NVME_WB_HOST_PERF_ENABLE
+	(void)queue_wait_ns;
+	(void)submit_ns;
+#endif
 }
 
 static bool nvme_wb_queue_async_notify(struct nvme_dev *dev,
@@ -2801,6 +2852,8 @@ static void nvme_wb_workfn(struct work_struct *work)
 	local_notify_ns += ktime_get_ns() - t_part;
 
 out_free:
+
+#if NVME_WB_HOST_PERF_ENABLE
 	atomic64_inc(&dev->wb.perf_work_calls);
 	atomic64_add(ktime_get_ns() - t0, &dev->wb.perf_work_ns);
 	atomic64_add(seg_cnt, &dev->wb.perf_work_segs);
@@ -2812,6 +2865,18 @@ out_free:
 	atomic64_add(local_notify_ns, &dev->wb.perf_notify_ns);
 	atomic64_add(local_complete_ns, &dev->wb.perf_complete_ns);
 	nvme_wb_perf_log_if_due(dev);
+#endif
+
+#if !NVME_WB_HOST_PERF_ENABLE
+	(void)t0;
+	(void)local_queue_wait_ns;
+	(void)local_mcp_read_ns;
+	(void)local_parse_ns;
+	(void)local_copy_ns;
+	(void)local_notify_ns;
+	(void)local_complete_ns;
+	(void)local_bytes;
+#endif
 
 	if (dev->wb.qctx && item->qid <= dev->wb.nr_io_queues_layout) {
 		unsigned long flags;
