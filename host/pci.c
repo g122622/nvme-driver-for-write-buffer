@@ -2431,7 +2431,7 @@ static int nvme_wb_submit_notify_batch(struct nvme_dev *dev,
 	cmd.common.cdw12 = cpu_to_le32(cnt);
 	cmd.common.cdw13 = cpu_to_le32(sizeof(*ents));
 
-	ret = __nvme_submit_sync_cmd(q, &cmd, ents, NULL, payload_len,
+	ret = __nvme_submit_sync_cmd(q, &cmd, NULL, ents, payload_len,
 			0, qid, 0,
 			BLK_MQ_REQ_NOWAIT | BLK_MQ_REQ_RESERVED);
 	if (ret) {
