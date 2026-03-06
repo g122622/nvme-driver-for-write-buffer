@@ -3218,6 +3218,12 @@ static void nvme_wb_try_complete_deferred(struct nvme_dev *dev,
 	nvme_req(req)->status = 0;
 	nvme_req(req)->result = cqe->result;
 
+	if (item->is_write) {
+		atomic64_inc(&dev->wb.mcp_ready_cnt);
+		nvme_wb_workfn(&item->work);
+		return;
+	}
+
 	qctx = &dev->wb.qctx[qid];
 	spin_lock_irqsave(&qctx->lock, flags);
 	list_add_tail(&item->node, &qctx->pending);
