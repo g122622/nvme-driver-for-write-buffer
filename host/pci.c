@@ -141,7 +141,7 @@ static bool __nvme_disable_io_queues(struct nvme_dev *dev, u8 opcode);
 #define NVME_WB_D5_VERSION		1U
 
 /* Keep in sync with controller-side config (FEMU common/l2p-cache-config.h). */
-#define NVME_WB_L2P_L2_SIZE_KB		(16 * 512 * 0)
+#define NVME_WB_L2P_L2_SIZE_KB		(512 * 4)
 #define NVME_WB_ALIGN_BYTES		4096ULL
 #define NVME_WB_MCP_ENTRY_BYTES		64U
 #define NVME_WB_MCP_ENTRIES_PER_Q	65536U
