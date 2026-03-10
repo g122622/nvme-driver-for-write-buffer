@@ -30,6 +30,7 @@
 #include <linux/math64.h>
 #include <linux/ktime.h>
 #include <linux/workqueue.h>
+#include <linux/hrtimer.h>
 
 #include "trace.h"
 #include "nvme.h"
@@ -155,7 +156,7 @@ static bool __nvme_disable_io_queues(struct nvme_dev *dev, u8 opcode);
 #define NVME_WB_MCP_F_LAST_SEG		(1U << 0)
 
 #ifndef NVME_WB_HOST_PERF_ENABLE
-#define NVME_WB_HOST_PERF_ENABLE	0
+#define NVME_WB_HOST_PERF_ENABLE	1
 #endif
 
 struct nvme_wb_kva_push_entry {
@@ -218,7 +219,9 @@ struct nvme_wb_queue_ctx {
 	struct list_head pending;
 
 	struct workqueue_struct *notify_wq;
-	struct delayed_work notify_work;
+	struct work_struct notify_work;
+	struct hrtimer notify_timer;
+	bool notify_timer_armed;
 	spinlock_t notify_lock;
 	struct list_head notify_pending;
 	u32 notify_pending_cnt;
@@ -241,6 +244,10 @@ struct nvme_wb_queue_ctx {
 	u32 mcp_capacity;
 	u32 mcp_head;
 };
+
+static enum hrtimer_restart nvme_wb_notify_timer_fn(struct hrtimer *timer);
+static void nvme_wb_notify_schedule(struct nvme_wb_queue_ctx *qctx,
+		bool immediate, u64 delay_ns);
 
 struct nvme_wb_ctx {
 	bool host_enabled;
@@ -2485,6 +2492,69 @@ static int nvme_wb_submit_notify_batch(struct nvme_dev *dev,
 	return 0;
 }
 
+static enum hrtimer_restart nvme_wb_notify_timer_fn(struct hrtimer *timer)
+{
+	struct nvme_wb_queue_ctx *qctx =
+		container_of(timer, struct nvme_wb_queue_ctx, notify_timer);
+	unsigned long flags;
+
+	spin_lock_irqsave(&qctx->notify_lock, flags);
+	qctx->notify_timer_armed = false;
+	spin_unlock_irqrestore(&qctx->notify_lock, flags);
+
+	if (qctx->notify_wq)
+		queue_work(qctx->notify_wq, &qctx->notify_work);
+
+	return HRTIMER_NORESTART;
+}
+
+static void nvme_wb_notify_schedule(struct nvme_wb_queue_ctx *qctx,
+		bool immediate, u64 delay_ns)
+{
+	unsigned long flags;
+	bool queue_now = false;
+
+	if (!qctx || !qctx->notify_wq)
+		return;
+
+	if (immediate) {
+		spin_lock_irqsave(&qctx->notify_lock, flags);
+		if (qctx->notify_timer_armed &&
+		    hrtimer_try_to_cancel(&qctx->notify_timer) >= 0) {
+			qctx->notify_timer_armed = false;
+		}
+		spin_unlock_irqrestore(&qctx->notify_lock, flags);
+		queue_work(qctx->notify_wq, &qctx->notify_work);
+		return;
+	}
+
+	spin_lock_irqsave(&qctx->notify_lock, flags);
+	if (!qctx->notify_pending_cnt) {
+		if (qctx->notify_timer_armed &&
+		    hrtimer_try_to_cancel(&qctx->notify_timer) >= 0) {
+			qctx->notify_timer_armed = false;
+		}
+		spin_unlock_irqrestore(&qctx->notify_lock, flags);
+		return;
+	}
+
+	if (delay_ns == 0) {
+		if (qctx->notify_timer_armed &&
+		    hrtimer_try_to_cancel(&qctx->notify_timer) >= 0) {
+			qctx->notify_timer_armed = false;
+		}
+		queue_now = true;
+	} else {
+		hrtimer_start(&qctx->notify_timer, ns_to_ktime(delay_ns),
+				HRTIMER_MODE_REL_PINNED);
+		qctx->notify_timer_armed = true;
+	}
+	spin_unlock_irqrestore(&qctx->notify_lock, flags);
+
+	if (queue_now)
+		queue_work(qctx->notify_wq, &qctx->notify_work);
+}
+
 static void nvme_wb_finish_req_fail(struct nvme_dev *dev, struct request *req)
 {
 	nvme_req(req)->status = NVME_SC_INTERNAL;
@@ -2495,7 +2565,7 @@ static void nvme_wb_finish_req_fail(struct nvme_dev *dev, struct request *req)
 static void nvme_wb_notify_workfn(struct work_struct *work)
 {
 	struct nvme_wb_queue_ctx *qctx =
-		container_of(to_delayed_work(work), struct nvme_wb_queue_ctx,
+		container_of(work, struct nvme_wb_queue_ctx,
 			notify_work);
 	struct nvme_dev *dev = qctx->dev;
 	struct request_queue *q;
@@ -2620,15 +2690,16 @@ static void nvme_wb_notify_workfn(struct work_struct *work)
 #endif
 
 	if (need_resched) {
-		unsigned long delay_j = 0;
+		u64 delay_ns = 0;
+		u64 now2 = ktime_get_ns();
 
 		spin_lock_irqsave(&qctx->notify_lock, flags);
 		if (!list_empty(&qctx->notify_pending) &&
-		    now < qctx->notify_batch_deadline_ns)
-			delay_j = usecs_to_jiffies(wb_d5_flush_us ?: 1);
+		    now2 < qctx->notify_batch_deadline_ns)
+			delay_ns = qctx->notify_batch_deadline_ns - now2;
 		spin_unlock_irqrestore(&qctx->notify_lock, flags);
 
-		mod_delayed_work(qctx->notify_wq, &qctx->notify_work, delay_j);
+		nvme_wb_notify_schedule(qctx, delay_ns == 0, delay_ns);
 	}
 
 #if !NVME_WB_HOST_PERF_ENABLE
@@ -2690,10 +2761,13 @@ static bool nvme_wb_queue_async_notify(struct nvme_dev *dev,
 	if (is_write && qctx->notify_pending_cnt >= qctx->batch_max)
 		qctx->notify_batch_deadline_ns = ktime_get_ns();
 	immediate = !is_write || qctx->notify_pending_cnt >= qctx->batch_max;
+	if (!immediate && qctx->notify_batch_deadline_ns > item->enqueue_ns)
+		now = qctx->notify_batch_deadline_ns - item->enqueue_ns;
+	else
+		now = 0;
 	spin_unlock_irqrestore(&qctx->notify_lock, flags);
 
-	mod_delayed_work(qctx->notify_wq, &qctx->notify_work,
-			immediate ? 0 : usecs_to_jiffies(wb_d5_flush_us ?: 1));
+	nvme_wb_notify_schedule(qctx, immediate, now);
 
 	return true;
 }
@@ -2908,7 +2982,7 @@ static void nvme_wb_cancel_all_pending(struct nvme_dev *dev)
 		if (qctx->wq)
 			flush_workqueue(qctx->wq);
 		if (qctx->notify_wq) {
-			cancel_delayed_work_sync(&qctx->notify_work);
+			hrtimer_cancel(&qctx->notify_timer);
 			flush_workqueue(qctx->notify_wq);
 		}
 
@@ -2952,7 +3026,7 @@ static void nvme_wb_destroy_qctx(struct nvme_dev *dev)
 
 	for (qid = 1; qid <= dev->wb.nr_io_queues_layout; qid++) {
 		if (dev->wb.qctx[qid].notify_wq)
-			cancel_delayed_work_sync(&dev->wb.qctx[qid].notify_work);
+			hrtimer_cancel(&dev->wb.qctx[qid].notify_timer);
 		if (dev->wb.qctx[qid].wq)
 			destroy_workqueue(dev->wb.qctx[qid].wq);
 		if (dev->wb.qctx[qid].notify_wq)
@@ -3058,6 +3132,7 @@ static int nvme_wb_setup_layout_and_workers(struct nvme_dev *dev)
 		qctx->notify_pending_hwm = 0;
 		qctx->notify_last_warn_ns = 0;
 		qctx->notify_batch_deadline_ns = 0;
+		qctx->notify_timer_armed = false;
 		qctx->notify_q = NULL;
 		qctx->batch_cnt = 0;
 		qctx->batch_max = wb_d5_batch_max ? wb_d5_batch_max : 64;
@@ -3082,7 +3157,10 @@ static int nvme_wb_setup_layout_and_workers(struct nvme_dev *dev)
 			spin_lock_init(&qctx->notify_lock);
 			spin_lock_init(&qctx->batch_lock);
 			INIT_LIST_HEAD(&qctx->notify_pending);
-			INIT_DELAYED_WORK(&qctx->notify_work, nvme_wb_notify_workfn);
+			INIT_WORK(&qctx->notify_work, nvme_wb_notify_workfn);
+			hrtimer_init(&qctx->notify_timer, CLOCK_MONOTONIC,
+					HRTIMER_MODE_REL_PINNED);
+			qctx->notify_timer.function = nvme_wb_notify_timer_fn;
 		}
 
 		if (!qctx->batch_buf) {
