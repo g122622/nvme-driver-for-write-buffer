@@ -117,7 +117,7 @@ module_param(wb_d5_batch_max, uint, 0644);
 MODULE_PARM_DESC(wb_d5_batch_max,
 	"WB 0xd5 batch max entries per submit (0 uses default 64)");
 
-static unsigned int wb_d5_flush_us = 500;
+static unsigned int wb_d5_flush_us = 1000;
 module_param(wb_d5_flush_us, uint, 0644);
 MODULE_PARM_DESC(wb_d5_flush_us,
 	"WB 0xd5 batch flush timeout in microseconds");
