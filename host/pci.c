@@ -259,17 +259,18 @@ static void nvme_legacy_io_perf_log_if_due(struct nvme_dev *dev);
 static void nvme_legacy_io_perf_complete(struct nvme_dev *dev,
 		struct request *req, u64 complete_start_ns, u64 complete_end_ns);
 
-static inline void nvme_legacy_io_perf_note_submit(struct nvme_dev *dev,
+static inline void nvme_legacy_io_perf_note_submit(
+		struct nvme_legacy_perf_ctx *legacy,
 		unsigned int dir)
 {
 	s64 inflight;
 	s64 peak;
 	s64 old_peak;
 
-	inflight = atomic64_inc_return(&dev->legacy.inflight_cur[dir]);
-	peak = atomic64_read(&dev->legacy.inflight_peak[dir]);
+	inflight = atomic64_inc_return(&legacy->inflight_cur[dir]);
+	peak = atomic64_read(&legacy->inflight_peak[dir]);
 	while (inflight > peak) {
-		old_peak = atomic64_cmpxchg(&dev->legacy.inflight_peak[dir],
+		old_peak = atomic64_cmpxchg(&legacy->inflight_peak[dir],
 					 peak, inflight);
 		if (old_peak == peak)
 			break;
@@ -1250,7 +1251,7 @@ static blk_status_t nvme_queue_rq(struct blk_mq_hw_ctx *hctx,
 		iod->legacy_issue_ns = issue_ns;
 		iod->legacy_prep_end_ns = prep_end_ns;
 		iod->legacy_submit_ns = ktime_get_ns();
-		nvme_legacy_io_perf_note_submit(dev, dir);
+		nvme_legacy_io_perf_note_submit(&dev->legacy, dir);
 	}
 #endif
 	return BLK_STS_OK;
