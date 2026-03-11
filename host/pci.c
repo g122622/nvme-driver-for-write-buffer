@@ -159,6 +159,12 @@ static bool __nvme_disable_io_queues(struct nvme_dev *dev, u8 opcode);
 #define NVME_WB_HOST_PERF_ENABLE	1
 #endif
 
+enum nvme_legacy_perf_dir {
+	NVME_LEGACY_PERF_READ = 0,
+	NVME_LEGACY_PERF_WRITE,
+	NVME_LEGACY_PERF_NR,
+};
+
 struct nvme_wb_kva_push_entry {
 	__le64 gpa;
 	__le64 kva;
@@ -248,6 +254,11 @@ struct nvme_wb_queue_ctx {
 static enum hrtimer_restart nvme_wb_notify_timer_fn(struct hrtimer *timer);
 static void nvme_wb_notify_schedule(struct nvme_wb_queue_ctx *qctx,
 		bool immediate, u64 delay_ns);
+#if NVME_WB_HOST_PERF_ENABLE
+static void nvme_legacy_io_perf_log_if_due(struct nvme_dev *dev);
+static void nvme_legacy_io_perf_complete(struct nvme_dev *dev,
+		struct request *req, u64 complete_start_ns, u64 complete_end_ns);
+#endif
 
 struct nvme_wb_ctx {
 	bool host_enabled;
@@ -305,6 +316,26 @@ struct nvme_wb_ctx {
 	u64 perf_last_fallback_cnt;
 };
 
+struct nvme_legacy_perf_ctx {
+	atomic64_t ios[NVME_LEGACY_PERF_NR];
+	atomic64_t bytes[NVME_LEGACY_PERF_NR];
+	atomic64_t prep_ns[NVME_LEGACY_PERF_NR];
+	atomic64_t submit_ns[NVME_LEGACY_PERF_NR];
+	atomic64_t device_ns[NVME_LEGACY_PERF_NR];
+	atomic64_t complete_ns[NVME_LEGACY_PERF_NR];
+	atomic64_t e2e_ns[NVME_LEGACY_PERF_NR];
+
+	spinlock_t perf_lock;
+	u64 perf_last_log_ns;
+	u64 perf_last_ios[NVME_LEGACY_PERF_NR];
+	u64 perf_last_bytes[NVME_LEGACY_PERF_NR];
+	u64 perf_last_prep_ns[NVME_LEGACY_PERF_NR];
+	u64 perf_last_submit_ns[NVME_LEGACY_PERF_NR];
+	u64 perf_last_device_ns[NVME_LEGACY_PERF_NR];
+	u64 perf_last_complete_ns[NVME_LEGACY_PERF_NR];
+	u64 perf_last_e2e_ns[NVME_LEGACY_PERF_NR];
+};
+
 static_assert(sizeof(struct nvme_wb_mcp_entry) == NVME_WB_MCP_ENTRY_BYTES);
 
 /*
@@ -354,6 +385,7 @@ struct nvme_dev {
 	struct nvme_host_mem_buf_desc *host_mem_descs;
 	void **host_mem_desc_bufs;
 	struct nvme_wb_ctx wb;
+	struct nvme_legacy_perf_ctx legacy;
 	unsigned int nr_allocated_queues;
 	unsigned int nr_write_queues;
 	unsigned int nr_poll_queues;
@@ -439,6 +471,13 @@ struct nvme_iod {
 	unsigned int dma_len;	/* length of single DMA segment mapping */
 	dma_addr_t meta_dma;
 	struct scatterlist *sg;
+#if NVME_WB_HOST_PERF_ENABLE
+	bool legacy_perf_tracked;
+	bool legacy_perf_is_write;
+	u64 legacy_issue_ns;
+	u64 legacy_prep_end_ns;
+	u64 legacy_submit_ns;
+#endif
 };
 
 static inline unsigned int nvme_dbbuf_size(struct nvme_dev *dev)
@@ -1139,6 +1178,10 @@ static blk_status_t nvme_queue_rq(struct blk_mq_hw_ctx *hctx,
 	struct request *req = bd->rq;
 	struct nvme_iod *iod = blk_mq_rq_to_pdu(req);
 	blk_status_t ret;
+#if NVME_WB_HOST_PERF_ENABLE
+	u64 issue_ns;
+	u64 prep_end_ns;
+#endif
 
 	/*
 	 * We should not need to do this, but we're still using this to
@@ -1150,13 +1193,38 @@ static blk_status_t nvme_queue_rq(struct blk_mq_hw_ctx *hctx,
 	if (unlikely(!nvme_check_ready(&dev->ctrl, req, true)))
 		return nvme_fail_nonready_command(&dev->ctrl, req);
 
+#if NVME_WB_HOST_PERF_ENABLE
+	iod->legacy_perf_tracked = false;
+	iod->legacy_perf_is_write = false;
+	iod->legacy_issue_ns = 0;
+	iod->legacy_prep_end_ns = 0;
+	iod->legacy_submit_ns = 0;
+	issue_ns = ktime_get_ns();
+#endif
+
 	ret = nvme_prep_rq(dev, req);
 	if (unlikely(ret))
 		return ret;
+
+#if NVME_WB_HOST_PERF_ENABLE
+	prep_end_ns = ktime_get_ns();
+#endif
 	spin_lock(&nvmeq->sq_lock);
 	nvme_sq_copy_cmd(nvmeq, &iod->cmd);
 	nvme_write_sq_db(nvmeq, bd->last);
 	spin_unlock(&nvmeq->sq_lock);
+
+#if NVME_WB_HOST_PERF_ENABLE
+	if (iod->cmd.common.opcode == nvme_cmd_read ||
+	    iod->cmd.common.opcode == nvme_cmd_write) {
+		iod->legacy_perf_tracked = true;
+		iod->legacy_perf_is_write =
+			iod->cmd.common.opcode == nvme_cmd_write;
+		iod->legacy_issue_ns = issue_ns;
+		iod->legacy_prep_end_ns = prep_end_ns;
+		iod->legacy_submit_ns = ktime_get_ns();
+	}
+#endif
 	return BLK_STS_OK;
 }
 
@@ -2162,6 +2230,184 @@ static bool nvme_wb_read_mcp_entry(struct nvme_dev *dev,
 }
 
 #if NVME_WB_HOST_PERF_ENABLE
+static void nvme_legacy_perf_ns_to_us2(u64 ns, u64 *us_int, u64 *us_frac)
+{
+	*us_int = div64_u64(ns, 1000);
+	*us_frac = div64_u64(ns % 1000, 10);
+}
+
+static void nvme_legacy_io_perf_log_if_due(struct nvme_dev *dev)
+{
+	struct nvme_legacy_perf_ctx *legacy = &dev->legacy;
+	u64 now = ktime_get_ns();
+	u64 cur_ios[NVME_LEGACY_PERF_NR];
+	u64 cur_bytes[NVME_LEGACY_PERF_NR];
+	u64 cur_prep_ns[NVME_LEGACY_PERF_NR];
+	u64 cur_submit_ns[NVME_LEGACY_PERF_NR];
+	u64 cur_device_ns[NVME_LEGACY_PERF_NR];
+	u64 cur_complete_ns[NVME_LEGACY_PERF_NR];
+	u64 cur_e2e_ns[NVME_LEGACY_PERF_NR];
+	u64 d_ios[NVME_LEGACY_PERF_NR];
+	u64 d_bytes[NVME_LEGACY_PERF_NR];
+	u64 d_prep_ns[NVME_LEGACY_PERF_NR];
+	u64 d_submit_ns[NVME_LEGACY_PERF_NR];
+	u64 d_device_ns[NVME_LEGACY_PERF_NR];
+	u64 d_complete_ns[NVME_LEGACY_PERF_NR];
+	u64 d_e2e_ns[NVME_LEGACY_PERF_NR];
+	u64 avg_prep_ns[NVME_LEGACY_PERF_NR] = { 0 };
+	u64 avg_submit_ns[NVME_LEGACY_PERF_NR] = { 0 };
+	u64 avg_device_ns[NVME_LEGACY_PERF_NR] = { 0 };
+	u64 avg_complete_ns[NVME_LEGACY_PERF_NR] = { 0 };
+	u64 avg_e2e_ns[NVME_LEGACY_PERF_NR] = { 0 };
+	u64 prep_us_int[NVME_LEGACY_PERF_NR] = { 0 };
+	u64 prep_us_frac[NVME_LEGACY_PERF_NR] = { 0 };
+	u64 submit_us_int[NVME_LEGACY_PERF_NR] = { 0 };
+	u64 submit_us_frac[NVME_LEGACY_PERF_NR] = { 0 };
+	u64 device_us_int[NVME_LEGACY_PERF_NR] = { 0 };
+	u64 device_us_frac[NVME_LEGACY_PERF_NR] = { 0 };
+	u64 complete_us_int[NVME_LEGACY_PERF_NR] = { 0 };
+	u64 complete_us_frac[NVME_LEGACY_PERF_NR] = { 0 };
+	u64 e2e_us_int[NVME_LEGACY_PERF_NR] = { 0 };
+	u64 e2e_us_frac[NVME_LEGACY_PERF_NR] = { 0 };
+	u64 total_ios;
+	int dir;
+
+	if (likely(now - READ_ONCE(legacy->perf_last_log_ns) < NSEC_PER_SEC))
+		return;
+
+	spin_lock(&legacy->perf_lock);
+	if (now - legacy->perf_last_log_ns < NSEC_PER_SEC) {
+		spin_unlock(&legacy->perf_lock);
+		return;
+	}
+
+	for (dir = 0; dir < NVME_LEGACY_PERF_NR; dir++) {
+		cur_ios[dir] = atomic64_read(&legacy->ios[dir]);
+		cur_bytes[dir] = atomic64_read(&legacy->bytes[dir]);
+		cur_prep_ns[dir] = atomic64_read(&legacy->prep_ns[dir]);
+		cur_submit_ns[dir] = atomic64_read(&legacy->submit_ns[dir]);
+		cur_device_ns[dir] = atomic64_read(&legacy->device_ns[dir]);
+		cur_complete_ns[dir] = atomic64_read(&legacy->complete_ns[dir]);
+		cur_e2e_ns[dir] = atomic64_read(&legacy->e2e_ns[dir]);
+
+		d_ios[dir] = cur_ios[dir] - legacy->perf_last_ios[dir];
+		d_bytes[dir] = cur_bytes[dir] - legacy->perf_last_bytes[dir];
+		d_prep_ns[dir] = cur_prep_ns[dir] - legacy->perf_last_prep_ns[dir];
+		d_submit_ns[dir] = cur_submit_ns[dir] - legacy->perf_last_submit_ns[dir];
+		d_device_ns[dir] = cur_device_ns[dir] - legacy->perf_last_device_ns[dir];
+		d_complete_ns[dir] = cur_complete_ns[dir] - legacy->perf_last_complete_ns[dir];
+		d_e2e_ns[dir] = cur_e2e_ns[dir] - legacy->perf_last_e2e_ns[dir];
+
+		if (d_ios[dir]) {
+			avg_prep_ns[dir] = div64_u64(d_prep_ns[dir], d_ios[dir]);
+			avg_submit_ns[dir] = div64_u64(d_submit_ns[dir], d_ios[dir]);
+			avg_device_ns[dir] = div64_u64(d_device_ns[dir], d_ios[dir]);
+			avg_complete_ns[dir] = div64_u64(d_complete_ns[dir], d_ios[dir]);
+			avg_e2e_ns[dir] = div64_u64(d_e2e_ns[dir], d_ios[dir]);
+
+			nvme_legacy_perf_ns_to_us2(avg_prep_ns[dir],
+						&prep_us_int[dir],
+						&prep_us_frac[dir]);
+			nvme_legacy_perf_ns_to_us2(avg_submit_ns[dir],
+						&submit_us_int[dir],
+						&submit_us_frac[dir]);
+			nvme_legacy_perf_ns_to_us2(avg_device_ns[dir],
+						&device_us_int[dir],
+						&device_us_frac[dir]);
+			nvme_legacy_perf_ns_to_us2(avg_complete_ns[dir],
+						&complete_us_int[dir],
+						&complete_us_frac[dir]);
+			nvme_legacy_perf_ns_to_us2(avg_e2e_ns[dir],
+						&e2e_us_int[dir],
+						&e2e_us_frac[dir]);
+		}
+	}
+
+	total_ios = d_ios[NVME_LEGACY_PERF_READ] + d_ios[NVME_LEGACY_PERF_WRITE];
+	legacy->perf_last_log_ns = now;
+	for (dir = 0; dir < NVME_LEGACY_PERF_NR; dir++) {
+		legacy->perf_last_ios[dir] = cur_ios[dir];
+		legacy->perf_last_bytes[dir] = cur_bytes[dir];
+		legacy->perf_last_prep_ns[dir] = cur_prep_ns[dir];
+		legacy->perf_last_submit_ns[dir] = cur_submit_ns[dir];
+		legacy->perf_last_device_ns[dir] = cur_device_ns[dir];
+		legacy->perf_last_complete_ns[dir] = cur_complete_ns[dir];
+		legacy->perf_last_e2e_ns[dir] = cur_e2e_ns[dir];
+	}
+
+	if (!total_ios) {
+		spin_unlock(&legacy->perf_lock);
+		return;
+	}
+
+	dev_info(dev->ctrl.device,
+		"[LEGACY-HOST] legacy_io perf(1s): READ ios=%llu bytes=%llu prep=%llu.%02lluus submit=%llu.%02lluus device=%llu.%02lluus complete=%llu.%02lluus e2e=%llu.%02lluus | WRITE ios=%llu bytes=%llu prep=%llu.%02lluus submit=%llu.%02lluus device=%llu.%02lluus complete=%llu.%02lluus e2e=%llu.%02lluus\n",
+		d_ios[NVME_LEGACY_PERF_READ],
+		d_bytes[NVME_LEGACY_PERF_READ],
+		prep_us_int[NVME_LEGACY_PERF_READ],
+		prep_us_frac[NVME_LEGACY_PERF_READ],
+		submit_us_int[NVME_LEGACY_PERF_READ],
+		submit_us_frac[NVME_LEGACY_PERF_READ],
+		device_us_int[NVME_LEGACY_PERF_READ],
+		device_us_frac[NVME_LEGACY_PERF_READ],
+		complete_us_int[NVME_LEGACY_PERF_READ],
+		complete_us_frac[NVME_LEGACY_PERF_READ],
+		e2e_us_int[NVME_LEGACY_PERF_READ],
+		e2e_us_frac[NVME_LEGACY_PERF_READ],
+		d_ios[NVME_LEGACY_PERF_WRITE],
+		d_bytes[NVME_LEGACY_PERF_WRITE],
+		prep_us_int[NVME_LEGACY_PERF_WRITE],
+		prep_us_frac[NVME_LEGACY_PERF_WRITE],
+		submit_us_int[NVME_LEGACY_PERF_WRITE],
+		submit_us_frac[NVME_LEGACY_PERF_WRITE],
+		device_us_int[NVME_LEGACY_PERF_WRITE],
+		device_us_frac[NVME_LEGACY_PERF_WRITE],
+		complete_us_int[NVME_LEGACY_PERF_WRITE],
+		complete_us_frac[NVME_LEGACY_PERF_WRITE],
+		e2e_us_int[NVME_LEGACY_PERF_WRITE],
+		e2e_us_frac[NVME_LEGACY_PERF_WRITE]);
+
+	spin_unlock(&legacy->perf_lock);
+}
+
+static void nvme_legacy_io_perf_complete(struct nvme_dev *dev,
+		struct request *req, u64 complete_start_ns, u64 complete_end_ns)
+{
+	struct nvme_iod *iod = blk_mq_rq_to_pdu(req);
+	unsigned int dir;
+	u64 prep_ns;
+	u64 submit_ns;
+	u64 device_ns;
+	u64 complete_ns;
+	u64 e2e_ns;
+
+	if (!iod->legacy_perf_tracked)
+		return;
+
+	iod->legacy_perf_tracked = false;
+	if (!iod->legacy_issue_ns || !iod->legacy_prep_end_ns ||
+	    !iod->legacy_submit_ns)
+		return;
+
+	dir = iod->legacy_perf_is_write ? NVME_LEGACY_PERF_WRITE :
+		NVME_LEGACY_PERF_READ;
+	prep_ns = iod->legacy_prep_end_ns - iod->legacy_issue_ns;
+	submit_ns = iod->legacy_submit_ns - iod->legacy_prep_end_ns;
+	device_ns = complete_start_ns - iod->legacy_submit_ns;
+	complete_ns = complete_end_ns - complete_start_ns;
+	e2e_ns = complete_start_ns - iod->legacy_issue_ns;
+
+	atomic64_inc(&dev->legacy.ios[dir]);
+	atomic64_add(blk_rq_bytes(req), &dev->legacy.bytes[dir]);
+	atomic64_add(prep_ns, &dev->legacy.prep_ns[dir]);
+	atomic64_add(submit_ns, &dev->legacy.submit_ns[dir]);
+	atomic64_add(device_ns, &dev->legacy.device_ns[dir]);
+	atomic64_add(complete_ns, &dev->legacy.complete_ns[dir]);
+	atomic64_add(e2e_ns, &dev->legacy.e2e_ns[dir]);
+
+	nvme_legacy_io_perf_log_if_due(dev);
+}
+
 static void nvme_wb_perf_log_if_due(struct nvme_dev *dev)
 {
 	struct nvme_wb_ctx *wb = &dev->wb;
@@ -2379,6 +2625,20 @@ static void nvme_wb_perf_log_if_due(struct nvme_dev *dev)
 static inline void nvme_wb_perf_log_if_due(struct nvme_dev *dev)
 {
 	(void)dev;
+}
+
+static inline void nvme_legacy_io_perf_log_if_due(struct nvme_dev *dev)
+{
+	(void)dev;
+}
+
+static inline void nvme_legacy_io_perf_complete(struct nvme_dev *dev,
+		struct request *req, u64 complete_start_ns, u64 complete_end_ns)
+{
+	(void)dev;
+	(void)req;
+	(void)complete_start_ns;
+	(void)complete_end_ns;
 }
 #endif
 
@@ -3312,8 +3572,16 @@ static void nvme_wb_try_complete_deferred(struct nvme_dev *dev,
 	return;
 
 complete_now:
-	if (!nvme_try_complete_req(req, cqe->status, cqe->result))
+	{
+		u64 complete_start_ns = ktime_get_ns();
+		u64 complete_end_ns;
+
+		if (!nvme_try_complete_req(req, cqe->status, cqe->result))
 		nvme_pci_complete_rq(req);
+		complete_end_ns = ktime_get_ns();
+		nvme_legacy_io_perf_complete(dev, req, complete_start_ns,
+					 complete_end_ns);
+	}
 }
 
 static int nvme_set_host_mem(struct nvme_dev *dev, u32 bits)
@@ -4467,6 +4735,7 @@ static struct nvme_dev *nvme_pci_alloc_dev(struct pci_dev *pdev,
 	unsigned long quirks = id->driver_data;
 	int node = dev_to_node(&pdev->dev);
 	struct nvme_dev *dev;
+	int dir;
 	int ret = -ENOMEM;
 
 	dev = kzalloc_node(sizeof(*dev), GFP_KERNEL, node);
@@ -4494,6 +4763,17 @@ static struct nvme_dev *nvme_pci_alloc_dev(struct pci_dev *pdev,
 	atomic64_set(&dev->wb.perf_complete_ns, 0);
 	spin_lock_init(&dev->wb.perf_lock);
 	dev->wb.perf_last_log_ns = ktime_get_ns();
+	for (dir = 0; dir < NVME_LEGACY_PERF_NR; dir++) {
+		atomic64_set(&dev->legacy.ios[dir], 0);
+		atomic64_set(&dev->legacy.bytes[dir], 0);
+		atomic64_set(&dev->legacy.prep_ns[dir], 0);
+		atomic64_set(&dev->legacy.submit_ns[dir], 0);
+		atomic64_set(&dev->legacy.device_ns[dir], 0);
+		atomic64_set(&dev->legacy.complete_ns[dir], 0);
+		atomic64_set(&dev->legacy.e2e_ns[dir], 0);
+	}
+	spin_lock_init(&dev->legacy.perf_lock);
+	dev->legacy.perf_last_log_ns = ktime_get_ns();
 
 	dev->nr_write_queues = write_queues;
 	dev->nr_poll_queues = poll_queues;
