@@ -258,25 +258,6 @@ static void nvme_wb_notify_schedule(struct nvme_wb_queue_ctx *qctx,
 static void nvme_legacy_io_perf_log_if_due(struct nvme_dev *dev);
 static void nvme_legacy_io_perf_complete(struct nvme_dev *dev,
 		struct request *req, u64 complete_start_ns, u64 complete_end_ns);
-
-static inline void nvme_legacy_io_perf_note_submit(
-		struct nvme_legacy_perf_ctx *legacy,
-		unsigned int dir)
-{
-	s64 inflight;
-	s64 peak;
-	s64 old_peak;
-
-	inflight = atomic64_inc_return(&legacy->inflight_cur[dir]);
-	peak = atomic64_read(&legacy->inflight_peak[dir]);
-	while (inflight > peak) {
-		old_peak = atomic64_cmpxchg(&legacy->inflight_peak[dir],
-					 peak, inflight);
-		if (old_peak == peak)
-			break;
-		peak = old_peak;
-	}
-}
 #endif
 
 struct nvme_wb_ctx {
@@ -356,6 +337,27 @@ struct nvme_legacy_perf_ctx {
 	u64 perf_last_complete_ns[NVME_LEGACY_PERF_NR];
 	u64 perf_last_total_ns[NVME_LEGACY_PERF_NR];
 };
+
+#if NVME_WB_HOST_PERF_ENABLE
+static inline void nvme_legacy_io_perf_note_submit(
+		struct nvme_legacy_perf_ctx *legacy,
+		unsigned int dir)
+{
+	s64 inflight;
+	s64 peak;
+	s64 old_peak;
+
+	inflight = atomic64_inc_return(&legacy->inflight_cur[dir]);
+	peak = atomic64_read(&legacy->inflight_peak[dir]);
+	while (inflight > peak) {
+		old_peak = atomic64_cmpxchg(&legacy->inflight_peak[dir],
+					 peak, inflight);
+		if (old_peak == peak)
+			break;
+		peak = old_peak;
+	}
+}
+#endif
 
 static_assert(sizeof(struct nvme_wb_mcp_entry) == NVME_WB_MCP_ENTRY_BYTES);
 
